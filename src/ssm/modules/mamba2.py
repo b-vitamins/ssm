@@ -28,6 +28,23 @@ class Mamba2(nn.Module):
         device=None,
         dtype=None,
     ) -> None:
+        """Initialize the reference Mamba2 block.
+
+        Args:
+            d_model: Model embedding dimension.
+            d_state: State size used by the selective scan dynamics.
+            d_conv: Depthwise convolution kernel width.
+            headdim: Channel dimension per attention-style head.
+            expand: Multiplicative expansion factor for the intermediate channel count.
+            ngroups: Number of groups for grouped convolutions (reserved for fused kernels).
+            d_ssm: Number of channels routed through the SSM branch.
+            chunk_size: Scan chunk size used by the reference ops implementation.
+            bias: Whether to include bias terms on the linear projections.
+            conv_bias: Whether to include bias terms on the convolution path.
+            layer_idx: Layer index metadata for potential parameter sharing.
+            device: Optional device for parameter initialization.
+            dtype: Optional dtype for parameter initialization.
+        """
         super().__init__()
 
         if expand * d_model % headdim != 0:
@@ -90,8 +107,8 @@ class Mamba2(nn.Module):
         """Evaluate the dense Mamba2 path.
 
         Args:
-            hidden_states (torch.Tensor): Input tensor shaped ``(batch, seqlen, d_model)``.
-            seq_lens (torch.Tensor | None): Optional vector of per-sequence lengths used to mask outputs.
+            hidden_states: torch.Tensor shaped ``(batch, seqlen, d_model)``.
+            seq_lens: Optional torch.Tensor of per-sequence lengths used to mask outputs.
 
         Returns:
             torch.Tensor: Output tensor shaped ``(batch, seqlen, d_model)``.
@@ -177,11 +194,12 @@ class Mamba2(nn.Module):
         """Route tokens through the reference Mamba2 implementation.
 
         Args:
-            hidden_states (torch.Tensor): Input tensor in dense ``(batch, seqlen, d_model)`` or
-                routed ``(tokens, d_model)``/``(1, tokens, d_model)`` format.
+            hidden_states: torch.Tensor in dense ``(batch, seqlen, d_model)`` or routed
+                ``(tokens, d_model)``/``(1, tokens, d_model)`` format.
             inference_params: Optional inference helper parameters (not yet supported).
-            seq_idx (torch.Tensor | None): Optional routing indices describing which sequence each token belongs to.
-            cu_seqlens (torch.Tensor | None): Exclusive prefix sums describing per-sequence lengths.
+            seq_idx: Optional torch.Tensor of routing indices describing which sequence each token
+                belongs to.
+            cu_seqlens: Optional torch.Tensor of exclusive prefix sums describing per-sequence lengths.
             **kwargs: Additional keyword arguments kept for API compatibility.
 
         Returns:
@@ -287,9 +305,9 @@ class Mamba2(nn.Module):
         """Allocate decoding cache tensors for streaming inference.
 
         Args:
-            batch_size (int): Maximum batch size expected during decode.
-            max_seqlen (int): Upper bound on the decoded sequence length. Unused by the reference path.
-            dtype (torch.dtype | None): Optional dtype override for the cache tensors.
+            batch_size: Maximum batch size expected during decode.
+            max_seqlen: Upper bound on the decoded sequence length. Unused by the reference path.
+            dtype: Optional dtype override for the cache tensors.
             **kwargs: Additional keyword arguments accepted for API parity.
 
         Returns:
