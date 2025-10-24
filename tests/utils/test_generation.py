@@ -66,7 +66,9 @@ def test_decode_teacher_forcing_with_streamer():
     assert len(output.scores) == 3
     assert all(score.shape[-1] == 6 for score in output.scores)
     assert streamer.ended is True
-    streamed = torch.stack(streamer.tokens, dim=1)
+    assert len(streamer.tokens) == teacher.shape[1] + 1
+    assert torch.equal(streamer.tokens[0], input_ids.cpu())
+    streamed = torch.stack(streamer.tokens[1:], dim=1)
     assert torch.equal(streamed, teacher)
     assert output.timings is not None
     assert output.timings["prefill"] >= 0.0

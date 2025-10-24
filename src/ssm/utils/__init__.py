@@ -7,7 +7,9 @@ from .dispatch import (
     has_python_reference,
 )
 from .generation import (
+    InferenceParams,
     DecodeOutput,
+    apply_repetition_penalty,
     decode,
     min_p_filter,
     sample_from_logits,
@@ -17,7 +19,9 @@ from .generation import (
 from .weights import load_config_hf, load_state_dict_hf, save_pretrained_local
 
 __all__ = [
+    "InferenceParams",
     "DecodeOutput",
+    "apply_repetition_penalty",
     "decode",
     "get_available_backend",
     "has_cpu_kernels",

@@ -6,6 +6,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 ### Added
+- Expanded generation helpers with reusable inference parameter management,
+  streaming hooks, repetition penalties, teacher forcing, and CUDA graph options
+  integrated into ``MambaLMHeadModel.generate``.
 - Enabled cached prefill/decode flows for the reference Mamba1 and Mamba2 blocks with
   regression tests covering dense and ragged stepping.
 - Mixer-style language model backbone with optional attention, Hugging Face
