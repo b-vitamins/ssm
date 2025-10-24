@@ -1,8 +1,25 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
+import time
 
 import torch
+
+
+@dataclass
+class DecodeOutput:
+    """Container returned by :func:`decode`.
+
+    Attributes:
+        sequences: Generated sequences including the prompt tokens.
+        scores: Optional list of per-step logits snapshots.
+        timings: Optional mapping of timing categories to durations in seconds.
+    """
+
+    sequences: torch.Tensor
+    scores: list[torch.Tensor] | None = None
+    timings: dict[str, float] | None = None
 
 
 def decode(
@@ -22,34 +39,154 @@ def decode(
     output_scores: bool = False,
     streamer: Optional[object] = None,
 ):
-    """Decoding loop (design-only stub).
+    """Run an autoregressive decoding loop using the provided ``model``.
 
-    Mirrors a standard greedy/sampling decode interface for causal LMs.
+    The implementation mirrors a lightweight version of the Hugging Face
+    generation utilities while remaining backend agnostic. Only the Python
+    reference path is exercised in the scaffold, but the helper prepares the
+    cache via ``model.allocate_inference_cache`` so that compiled backends can
+    plug in later.
 
     Args:
-        input_ids: Prompt `(B, L)`.
-        model: Module exposing forward/generate-compatible interface.
-        max_length: Target total length.
-        top_k: Top-k sampling; 1 for greedy.
+        input_ids: Prompt tensor of shape ``(batch, prompt_length)``.
+        model: Module exposing ``allocate_inference_cache`` and ``forward``.
+        max_length: Target total sequence length (prompt + generated tokens).
+        top_k: Top-k sampling parameter. ``1`` corresponds to greedy decoding.
         top_p: Nucleus sampling parameter.
-        min_p: Min-p sampling parameter.
-        temperature: Softmax temperature.
-        repetition_penalty: Repetition penalty coefficient.
-        eos_token_id: Optional EOS id to stop early.
-        teacher_outputs: Optional teacher tokens for deterministic testing.
-        vocab_size: Optional vocab truncation for logits.
-        cg: If True, use CUDA graph capture when supported.
-        enable_timing: If True, collect timing events.
-        output_scores: If True, return per-step logits as scores.
-        streamer: Optional streaming callback.
+        min_p: Minimum probability filter parameter.
+        temperature: Softmax temperature applied before sampling.
+        repetition_penalty: Currently unused placeholder for future support.
+        eos_token_id: Optional end-of-sequence token id for early stopping.
+        teacher_outputs: Optional tensor providing tokens for each decode step.
+        vocab_size: Optional cap for the logits dimension prior to sampling.
+        cg: If ``True`` attempt to use CUDA graph capture. This is a no-op for
+            the CPU/reference path but the flag is accepted for API parity.
+        enable_timing: If ``True`` collect simple timing metrics.
+        output_scores: If ``True`` collect the per-step logits snapshots.
+        streamer: Optional streaming callback with a ``put`` method accepting
+            decoded token tensors and an optional ``end`` method.
 
     Returns:
-        An object with `sequences` and optional `scores` fields.
+        DecodeOutput: Structure containing ``sequences`` and optional ``scores``
+        and ``timings`` fields.
 
     Raises:
-        NotImplementedError: Implementation to be supplied later.
+        ValueError: If shapes are invalid or ``temperature`` is not positive.
     """
-    raise NotImplementedError("utils.decode is not implemented in the scaffold.")
+
+    del cg  # CUDA graphs are not exercised in the reference implementation.
+
+    if input_ids.dim() != 2:
+        raise ValueError("input_ids must have shape (batch, seqlen)")
+    if max_length <= 0:
+        raise ValueError("max_length must be positive")
+
+    batch_size, prompt_length = input_ids.shape
+    if max_length <= prompt_length:
+        truncated = input_ids[:, :max_length].clone()
+        scores: list[torch.Tensor] | None = [] if output_scores else None
+        timings = {"prefill": 0.0, "decode": 0.0} if enable_timing else None
+        if streamer is not None and hasattr(streamer, "end"):
+            streamer.end()
+        return DecodeOutput(sequences=truncated, scores=scores, timings=timings)
+
+    steps = max_length - prompt_length
+    if teacher_outputs is not None:
+        if teacher_outputs.shape[0] != batch_size:
+            raise ValueError("teacher_outputs must match batch size")
+        if teacher_outputs.shape[1] < steps:
+            raise ValueError("teacher_outputs shorter than required steps")
+
+    # Allocate cache if available; tolerate models without an inference cache.
+    cache = None
+    if hasattr(model, "allocate_inference_cache"):
+        try:
+            first_param = next(model.parameters())  # type: ignore[attr-defined]
+            param_dtype = first_param.dtype
+            param_device = first_param.device
+        except StopIteration:
+            param_dtype = None
+            param_device = input_ids.device
+        cache = model.allocate_inference_cache(  # type: ignore[attr-defined]
+            batch_size=batch_size,
+            max_seqlen=max_length,
+            dtype=param_dtype,
+        )
+        if isinstance(cache, dict) and "device" not in cache:
+            cache.setdefault("device", param_device)
+
+    scores = [] if output_scores else None
+    sequences = input_ids.clone()
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+
+    timings = {"prefill": 0.0, "decode": 0.0} if enable_timing else None
+    prefill_start = time.perf_counter() if enable_timing else None
+
+    was_training = getattr(model, "training", False)
+
+    try:
+        model.eval()
+        with torch.no_grad():
+            outputs = model(
+                sequences,
+                inference_params=cache,
+                num_last_tokens=1,
+            )
+            if timings is not None and prefill_start is not None:
+                timings["prefill"] = time.perf_counter() - prefill_start
+
+            logits = outputs.logits[:, -1, :]
+            decode_start = time.perf_counter() if enable_timing else None
+
+            for step in range(steps):
+                step_logits = logits
+                if vocab_size is not None:
+                    step_logits = step_logits[..., :vocab_size]
+                if scores is not None:
+                    scores.append(step_logits.detach().clone())
+
+                if teacher_outputs is not None:
+                    next_tokens = teacher_outputs[:, step]
+                else:
+                    next_tokens = sample_from_logits(
+                        step_logits,
+                        top_k=top_k,
+                        top_p=top_p,
+                        min_p=min_p,
+                        temperature=temperature,
+                    )
+
+                if eos_token_id is not None:
+                    next_tokens = next_tokens.masked_fill(finished, eos_token_id)
+
+                sequences = torch.cat([sequences, next_tokens.unsqueeze(-1)], dim=-1)
+
+                if eos_token_id is not None:
+                    finished = finished | (next_tokens == eos_token_id)
+                    if finished.all():
+                        if streamer is not None and hasattr(streamer, "put"):
+                            streamer.put(next_tokens)
+                        break
+
+                if streamer is not None and hasattr(streamer, "put"):
+                    streamer.put(next_tokens)
+
+                outputs = model(
+                    next_tokens.unsqueeze(-1),
+                    inference_params=cache,
+                    num_last_tokens=1,
+                )
+                logits = outputs.logits[:, -1, :]
+
+            if timings is not None and decode_start is not None:
+                timings["decode"] = time.perf_counter() - decode_start
+    finally:
+        if was_training:
+            model.train()
+        if streamer is not None and hasattr(streamer, "end"):
+            streamer.end()
+
+    return DecodeOutput(sequences=sequences, scores=scores, timings=timings)
 
 
 def top_k_filter(logits: torch.Tensor, top_k: int) -> torch.Tensor:
