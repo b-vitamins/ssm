@@ -8,6 +8,25 @@ from torch import nn
 from ssm import ops
 
 
+def _compute_dtype(tensor: torch.Tensor) -> torch.dtype:
+    """Return the accumulation dtype for a given tensor."""
+
+    if tensor.dtype in (torch.float16, torch.bfloat16):
+        return torch.float32
+    return tensor.dtype
+
+
+def _linear_1x1(linear: nn.Linear, x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Apply a linear layer to channel-first inputs without extra transposes."""
+
+    weight = linear.weight.to(dtype)
+    bias = linear.bias.to(dtype) if linear.bias is not None else None
+    out = torch.einsum("oc,bcl->bol", weight, x)
+    if bias is not None:
+        out = out + bias.view(1, -1, 1)
+    return out
+
+
 class Mamba1(nn.Module):
     """Selective SSM (Mamba v1) block backed by the reference ops.
 
@@ -77,9 +96,13 @@ class Mamba1(nn.Module):
         if dtype is not None:
             factory_kwargs["dtype"] = dtype
 
-        self.in_proj = nn.Linear(d_model, 2 * self.inner_dim, bias=bias, **factory_kwargs)
+        self.in_proj = nn.Linear(
+            d_model, 2 * self.inner_dim, bias=bias, **factory_kwargs
+        )
         self.out_proj = nn.Linear(self.inner_dim, d_model, bias=bias, **factory_kwargs)
-        self.dt_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=True, **factory_kwargs)
+        self.dt_proj = nn.Linear(
+            self.inner_dim, self.inner_dim, bias=True, **factory_kwargs
+        )
 
         conv_weight = torch.randn(self.inner_dim, d_conv, **factory_kwargs) * 0.02
         self.conv_weight = nn.Parameter(conv_weight)
@@ -89,9 +112,15 @@ class Mamba1(nn.Module):
             self.register_parameter("conv_bias", None)
 
         # Selective scan parameterisation (broadcast to ops contract).
-        self.A_log = nn.Parameter(torch.zeros(self.inner_dim, d_state, **factory_kwargs))
-        self.B = nn.Parameter(torch.randn(self.inner_dim, d_state, **factory_kwargs) * 0.02)
-        self.C = nn.Parameter(torch.randn(self.inner_dim, d_state, **factory_kwargs) * 0.02)
+        self.A_log = nn.Parameter(
+            torch.zeros(self.inner_dim, d_state, **factory_kwargs)
+        )
+        self.B = nn.Parameter(
+            torch.randn(self.inner_dim, d_state, **factory_kwargs) * 0.02
+        )
+        self.C = nn.Parameter(
+            torch.randn(self.inner_dim, d_state, **factory_kwargs) * 0.02
+        )
         self.D = nn.Parameter(torch.ones(self.inner_dim, **factory_kwargs))
         self.dt_bias = nn.Parameter(torch.zeros(self.inner_dim, **factory_kwargs))
 
@@ -119,19 +148,21 @@ class Mamba1(nn.Module):
         projected = cast(torch.Tensor, projected)
         gate = cast(torch.Tensor, gate)
 
+        compute_dtype = _compute_dtype(hidden_states)
+
         conv_input = projected.permute(0, 2, 1)
         conv_out = ops.dw_causal_conv(
             conv_input,
             self.conv_weight,
             bias=self.conv_bias,
             activation="silu",
-        ).permute(0, 2, 1)
+        ).to(compute_dtype)
 
-        delta = self.dt_proj(conv_out).permute(0, 2, 1)
-        u = conv_out.permute(0, 2, 1)
-        z = gate.permute(0, 2, 1)
+        delta = _linear_1x1(self.dt_proj, conv_out, compute_dtype)
+        u = conv_out
+        z = gate.permute(0, 2, 1).to(compute_dtype)
 
-        A = -torch.exp(self.A_log)
+        A = -torch.exp(self.A_log.to(compute_dtype))
         scan_out = ops.selective_scan(
             u=u,
             delta=delta,
@@ -144,12 +175,14 @@ class Mamba1(nn.Module):
             softplus=True,
         )
         if isinstance(scan_out, tuple):
-            output = scan_out[0]
+            output = cast(torch.Tensor, scan_out[0])
         else:
-            output = scan_out
+            output = cast(torch.Tensor, scan_out)
 
-        output = cast(torch.Tensor, output).permute(0, 2, 1)
-        return self.out_proj(output)
+        output = output.permute(0, 2, 1)
+        proj_input = output.to(self.out_proj.weight.dtype)
+        projected_out = self.out_proj(proj_input)
+        return projected_out.to(hidden_states.dtype)
 
     def allocate_inference_cache(
         self,
@@ -195,4 +228,3 @@ class Mamba1(nn.Module):
             dtype=cache_dtype,
         )
         return conv_state, ssm_state
-
