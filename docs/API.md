@@ -118,16 +118,25 @@ class Block(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, residual: torch.Tensor | None = None, inference_params=None, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+    def allocate_inference_cache(
+        self, batch_size: int, max_seqlen: int, dtype: torch.dtype | None = None, **kwargs
+    ) -> tuple[torch.Tensor, ...]: ...
 ```
 
 Contract
-- Returns `(hidden_states, residual)`; forward may raise `NotImplementedError` until fused norms exist.
+- Returns `(hidden_states, residual)` using the provided mixer and optional MLP.
+- Respects the `fused_add_norm` and `residual_in_fp32` flags with a Triton fast-path when
+  available, otherwise executes the PyTorch fallback.
+- `allocate_inference_cache` defers to the wrapped mixer implementation.
 
 ### ssm.modules.attention.MHA
-Signatures mirror typical PyTorch MHA with KV cache update for decoding; API only, implemented later.
+Implements multi-head attention with optional grouped KV heads, depthwise convolution, rotary embeddings,
+and fused gated MLP packing. Supports cache allocation and incremental decoding via `allocate_inference_cache`
+and the `inference_params` protocol (matching the reference `mamba_ssm` repository).
 
 ### ssm.modules.mlp.GatedMLP
-Standard gated MLP signature with Google-style docstrings; behavior defined but not implemented.
+Two-layer gated MLP (SwiGLU style) with configurable hidden size rounding and activation.
 
 ## Models
 
