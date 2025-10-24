@@ -25,6 +25,7 @@
 
 ## Coding Style & Naming Conventions
 - Python: PEP 8/PEP 257 with Google‑style docstrings (include “Args:” and “Returns:”).
+- Docstrings must follow idiomatic Google style with explicit sections (for example, "Args:", "Returns:", "Raises:") and type hints where practical.
 - Naming: packages/modules `snake_case`, classes `CamelCase`, functions/args `snake_case`.
 - Stubs: unimplemented public functions/classes must raise `NotImplementedError` and document contracts.
 - Linters/formatters: none enforced yet; recommend `ruff` + `black` locally.

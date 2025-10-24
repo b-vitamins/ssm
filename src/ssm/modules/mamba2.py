@@ -87,6 +87,18 @@ class Mamba2(nn.Module):
     def _forward_impl(
         self, hidden_states: torch.Tensor, seq_lens: torch.Tensor | None
     ) -> torch.Tensor:
+        """Evaluate the dense Mamba2 path.
+
+        Args:
+            hidden_states (torch.Tensor): Input tensor shaped ``(batch, seqlen, d_model)``.
+            seq_lens (torch.Tensor | None): Optional vector of per-sequence lengths used to mask outputs.
+
+        Returns:
+            torch.Tensor: Output tensor shaped ``(batch, seqlen, d_model)``.
+
+        Raises:
+            ValueError: If ``hidden_states`` does not have rank 3 with ``d_model`` features.
+        """
         if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.d_model:
             raise ValueError("hidden_states must have shape (B, L, d_model).")
 
@@ -162,6 +174,23 @@ class Mamba2(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        """Route tokens through the reference Mamba2 implementation.
+
+        Args:
+            hidden_states (torch.Tensor): Input tensor in dense ``(batch, seqlen, d_model)`` or
+                routed ``(tokens, d_model)``/``(1, tokens, d_model)`` format.
+            inference_params: Optional inference helper parameters (not yet supported).
+            seq_idx (torch.Tensor | None): Optional routing indices describing which sequence each token belongs to.
+            cu_seqlens (torch.Tensor | None): Exclusive prefix sums describing per-sequence lengths.
+            **kwargs: Additional keyword arguments kept for API compatibility.
+
+        Returns:
+            torch.Tensor: Output tensor matching the layout of ``hidden_states``.
+
+        Raises:
+            NotImplementedError: If ``inference_params`` is supplied.
+            ValueError: If the provided routing metadata is invalid for the given inputs.
+        """
         if inference_params is not None:
             raise NotImplementedError("Inference cache stepping is not implemented.")
 
@@ -257,9 +286,16 @@ class Mamba2(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Allocate decoding cache tensors for streaming inference.
 
+        Args:
+            batch_size (int): Maximum batch size expected during decode.
+            max_seqlen (int): Upper bound on the decoded sequence length. Unused by the reference path.
+            dtype (torch.dtype | None): Optional dtype override for the cache tensors.
+            **kwargs: Additional keyword arguments accepted for API parity.
+
         Returns:
-            Dict with ``conv_state`` ``(B, expand * d_model, d_conv)`` and
-            ``ssd_state`` ``(B, ssm_heads, headdim)`` entries.
+            dict[str, torch.Tensor]: Dictionary containing ``conv_state`` with shape
+            ``(batch_size, expand * d_model, d_conv)`` and ``ssd_state`` with shape
+            ``(batch_size, ssm_heads, headdim)``.
         """
 
         del max_seqlen
