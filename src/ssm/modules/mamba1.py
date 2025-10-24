@@ -205,11 +205,7 @@ class Mamba1(nn.Module):
         batch_end = batch_start + batch
         target_batch = max(batch_end, 0)
         cache = cache_dict.get(self.layer_idx)
-        if (
-            cache is None
-            or cache[0].shape[0] < target_batch
-            or cache[1].shape[0] < target_batch
-        ):
+        if cache is None:
             cache = self.allocate_inference_cache(
                 batch_size=target_batch,
                 max_seqlen=getattr(
@@ -220,6 +216,23 @@ class Mamba1(nn.Module):
                 dtype=hidden_states.dtype,
             )
             cache_dict[self.layer_idx] = cache
+        else:
+            conv_cache, ssm_cache = cache
+            if conv_cache.shape[0] < target_batch or ssm_cache.shape[0] < target_batch:
+                new_cache = self.allocate_inference_cache(
+                    batch_size=target_batch,
+                    max_seqlen=getattr(
+                        inference_params,
+                        "max_seqlen",
+                        hidden_states.shape[1],
+                    ),
+                    dtype=conv_cache.dtype,
+                )
+                new_conv_cache, new_ssm_cache = new_cache
+                new_conv_cache[: conv_cache.shape[0]].copy_(conv_cache)
+                new_ssm_cache[: ssm_cache.shape[0]].copy_(ssm_cache)
+                cache = new_cache
+                cache_dict[self.layer_idx] = cache
 
         conv_cache, ssm_cache = cache
         conv_slice = conv_cache[batch_start:batch_end]
