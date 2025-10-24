@@ -11,12 +11,14 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Minimal GRU-backed `MambaLMHeadModel` forward pass wired for cache-aware decoding.
 - Generation helpers plus greedy/top-k/top-p/min-p sampling integration with coverage in CPU tests.
 - CPU fused kernels for the core ops with dispatch, smoke tests, and benchmarking harness.
+- CUDA kernels and bindings for selective scan, selective state step, SSD chunk scan, depthwise causal convolution, and fused layer norm with GPU-dispatch integration and CUDA-focused tests.
 ### Changed
 - Documented the required developer workflow to install dependencies on session start and to run `ruff`, `pyright`, and `pytest` before opening pull requests.
 - Expanded the contributor workflow to mandate running `ruff format .` before linting and tests, aligning local practice with CI.
 - Simplified `scripts/regenerate_goldens.py` to rely on the editable install instead of mutating `sys.path`.
 - Added NumPy as a core dependency so Torch can initialize its NumPy bridge without warnings.
 - Standardized the CI pipeline on Python 3.11 to reduce redundant matrix executions.
+- Strengthened AGENTS.md instructions to enforce proactive CHANGELOG updates ahead of every PR.
 ### Fixed
 - Corrected top-p nucleus sampling to retain the threshold token and added a regression test guarding against regressions.
 - Tightened the decode streamer typing to satisfy static analysis and prevent CI regressions.

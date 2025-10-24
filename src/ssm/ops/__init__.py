@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -15,9 +16,16 @@ try:
 except ImportError:  # pragma: no cover - torch utils missing
     _load_extension = None
 
+try:  # pragma: no cover - optional CUDA AMP import
+    from torch.cuda.amp import autocast as _cuda_autocast
+except Exception:  # pragma: no cover - CUDA AMP unavailable
+    _cuda_autocast = None
+
 
 _CPU_OPS: Any = None
 _CPU_LOAD_ERROR: Optional[Exception] = None
+_CUDA_OPS: Any = None
+_CUDA_LOAD_ERROR: Optional[Exception] = None
 
 
 @dataclass(frozen=True)
@@ -35,6 +43,18 @@ def _cpu_sources() -> list[str]:
         str(root / "ssd_chunk_scan.cpp"),
         str(root / "dw_causal_conv.cpp"),
         str(root / "layer_norm.cpp"),
+    ]
+
+
+def _cuda_sources() -> list[str]:
+    root = Path(__file__).resolve().parent / "cuda"
+    return [
+        str(root / "bindings.cpp"),
+        str(root / "selective_scan.cu"),
+        str(root / "state_step.cu"),
+        str(root / "ssd_chunk_scan.cu"),
+        str(root / "dw_causal_conv.cu"),
+        str(root / "layer_norm.cu"),
     ]
 
 
@@ -61,8 +81,44 @@ def _load_cpu_ops() -> Optional[Any]:
         return None
 
 
+def _load_cuda_ops() -> Optional[Any]:
+    global _CUDA_OPS, _CUDA_LOAD_ERROR
+    if _CUDA_OPS is not None:
+        return _CUDA_OPS
+    if _CUDA_LOAD_ERROR is not None:
+        return None
+    if _load_extension is None:
+        _CUDA_LOAD_ERROR = RuntimeError("torch.utils.cpp_extension.load unavailable")
+        return None
+    if not torch.cuda.is_available():
+        _CUDA_LOAD_ERROR = RuntimeError("CUDA is not available")
+        return None
+
+    try:
+        _CUDA_OPS = _load_extension(
+            name="ssm_cuda_ops",
+            sources=_cuda_sources(),
+            extra_cflags=["-O3"],
+            extra_cuda_cflags=["-O3"],
+            verbose=False,
+        )
+        return _CUDA_OPS
+    except Exception as exc:  # pragma: no cover - build environment specific
+        _CUDA_LOAD_ERROR = exc
+        return None
+
+
 def _should_use_cpu(*tensors: Optional[torch.Tensor]) -> bool:
     return all(t.device.type == "cpu" for t in tensors if isinstance(t, torch.Tensor))
+
+
+def _should_use_cuda(*tensors: Optional[torch.Tensor]) -> bool:
+    devices = [t.device.type for t in tensors if isinstance(t, torch.Tensor)]
+    if not devices:
+        return False
+    if any(device == "cuda" for device in devices):
+        return all(device == "cuda" for device in devices)
+    return False
 
 
 def _cpu_backend_status() -> _BackendCandidate:
@@ -70,10 +126,26 @@ def _cpu_backend_status() -> _BackendCandidate:
     return _BackendCandidate(name="cpu", available=ops is not None)
 
 
+def _cuda_backend_status() -> _BackendCandidate:
+    ops = _load_cuda_ops()
+    return _BackendCandidate(name="cuda", available=ops is not None)
+
+
 def _invoke_cpu(fn, *args, **kwargs):
     try:
         return fn(*args, **kwargs)
     except RuntimeError as exc:  # translate contract violations
+        raise ValueError(str(exc)) from None
+
+
+def _invoke_cuda(fn, *args, **kwargs):
+    context = (
+        _cuda_autocast(enabled=False) if _cuda_autocast is not None else nullcontext()
+    )
+    try:
+        with context:
+            return fn(*args, **kwargs)
+    except RuntimeError as exc:
         raise ValueError(str(exc)) from None
 
 
@@ -89,6 +161,26 @@ def selective_scan(
     softplus: bool = False,
     return_last_state: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if _should_use_cuda(u, delta, A, B, C, D, z, dt_bias):
+        ops = _load_cuda_ops()
+        if ops is not None:
+            result = _invoke_cuda(
+                ops.selective_scan,
+                u,
+                delta,
+                A,
+                B,
+                C,
+                D,
+                z,
+                dt_bias,
+                softplus,
+                return_last_state,
+            )
+            output, last_state = result
+            if return_last_state:
+                return output, last_state
+            return output
     if _should_use_cpu(u, delta, A, B, C, D, z, dt_bias):
         ops = _load_cpu_ops()
         if ops is not None:
@@ -135,6 +227,22 @@ def selective_state_step(
     dt_bias: torch.Tensor | None = None,
     softplus: bool = True,
 ) -> torch.Tensor:
+    if _should_use_cuda(state, x, dt, A, B, C, D, z, dt_bias):
+        ops = _load_cuda_ops()
+        if ops is not None:
+            return _invoke_cuda(
+                ops.selective_state_step,
+                state,
+                x,
+                dt,
+                A,
+                B,
+                C,
+                D,
+                z,
+                dt_bias,
+                softplus,
+            )
     if _should_use_cpu(state, x, dt, A, B, C, D, z, dt_bias):
         ops = _load_cpu_ops()
         if ops is not None:
@@ -201,6 +309,24 @@ def ssd_chunk_scan(
     seq_meta: Optional[dict[str, Any]] = None,
     initial_states: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if _should_use_cuda(X, dt, A, B, C, D, z, initial_states):
+        ops = _load_cuda_ops()
+        if ops is not None:
+            seq_lens_tensor, cu_seqlens_tensor = _prepare_seq_meta(seq_meta, X.device)
+            return _invoke_cuda(
+                ops.ssd_chunk_scan,
+                X,
+                dt,
+                A,
+                B,
+                C,
+                chunk_size,
+                D,
+                z,
+                seq_lens_tensor,
+                cu_seqlens_tensor,
+                initial_states,
+            )
     if _should_use_cpu(X, dt, A, B, C, D, z, initial_states):
         ops = _load_cpu_ops()
         if ops is not None:
@@ -239,6 +365,10 @@ def dw_causal_conv(
     bias: torch.Tensor | None = None,
     activation: str = "silu",
 ) -> torch.Tensor:
+    if _should_use_cuda(x, weight, bias):
+        ops = _load_cuda_ops()
+        if ops is not None:
+            return _invoke_cuda(ops.dw_causal_conv, x, weight, bias, activation)
     if _should_use_cpu(x, weight, bias):
         ops = _load_cpu_ops()
         if ops is not None:
@@ -256,6 +386,20 @@ def fused_layer_norm(
     prenorm: bool = True,
     residual_in_fp32: bool = True,
 ) -> torch.Tensor:
+    if _should_use_cuda(x, weight, bias, residual):
+        ops = _load_cuda_ops()
+        if ops is not None:
+            return _invoke_cuda(
+                ops.fused_layer_norm,
+                x,
+                weight,
+                bias,
+                residual,
+                is_rms,
+                eps,
+                prenorm,
+                residual_in_fp32,
+            )
     if _should_use_cpu(x, weight, bias, residual):
         ops = _load_cpu_ops()
         if ops is not None:
@@ -288,6 +432,8 @@ __all__ = [
     "ssd_chunk_scan",
     "dw_causal_conv",
     "fused_layer_norm",
+    "_cpu_backend_status",
+    "_cuda_backend_status",
 ]
 
 selective_scan.__doc__ = reference_ops.selective_scan.__doc__
