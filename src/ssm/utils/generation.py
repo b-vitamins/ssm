@@ -88,7 +88,9 @@ def top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
     sorted_probs = torch.softmax(sorted_logits, dim=-1)
     cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
     mask = cumulative_probs > top_p
-    # Always keep at least one token.
+    # Shift the mask to keep the first token whose inclusion pushes the mass
+    # over the threshold, matching standard nucleus sampling.
+    mask[..., 1:] = mask[..., :-1].clone()
     mask[..., 0] = False
     sorted_logits = sorted_logits.masked_fill(mask, float("-inf"))
     filtered = logits.clone()
