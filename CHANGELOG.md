@@ -10,6 +10,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Contributor guide (AGENTS.md) with Conventional Commits and CHANGELOG policy.
 - Minimal GRU-backed `MambaLMHeadModel` forward pass wired for cache-aware decoding.
 - Generation helpers plus greedy/top-k/top-p/min-p sampling integration with coverage in CPU tests.
+- CPU fused kernels for the core ops with dispatch, smoke tests, and benchmarking harness.
 ### Changed
 - Documented the required developer workflow to install dependencies on session start and to run `ruff`, `pyright`, and `pytest` before opening pull requests.
 - Expanded the contributor workflow to mandate running `ruff format .` before linting and tests, aligning local practice with CI.
