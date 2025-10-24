@@ -457,10 +457,7 @@ class Mamba2(nn.Module):
         target_batch = max(batch_end, 0)
 
         cache = cache_dict.get(self.layer_idx)
-        if cache is None or (
-            cache["conv_state"].shape[0] < target_batch
-            or cache["ssd_state"].shape[0] < target_batch
-        ):
+        if cache is None:
             cache = self.allocate_inference_cache(
                 batch_size=target_batch,
                 max_seqlen=getattr(
@@ -471,6 +468,25 @@ class Mamba2(nn.Module):
                 dtype=hidden_states.dtype,
             )
             cache_dict[self.layer_idx] = cache
+        else:
+            conv_cache = cache["conv_state"]
+            ssd_cache = cache["ssd_state"]
+            if conv_cache.shape[0] < target_batch or ssd_cache.shape[0] < target_batch:
+                new_cache = self.allocate_inference_cache(
+                    batch_size=target_batch,
+                    max_seqlen=getattr(
+                        inference_params,
+                        "max_seqlen",
+                        hidden_states.shape[1] if hidden_states.ndim == 3 else 1,
+                    ),
+                    dtype=conv_cache.dtype,
+                )
+                new_conv_cache = new_cache["conv_state"]
+                new_ssd_cache = new_cache["ssd_state"]
+                new_conv_cache[: conv_cache.shape[0]].copy_(conv_cache)
+                new_ssd_cache[: ssd_cache.shape[0]].copy_(ssd_cache)
+                cache = new_cache
+                cache_dict[self.layer_idx] = cache
 
         conv_cache = cache["conv_state"]
         ssd_cache = cache["ssd_state"]
