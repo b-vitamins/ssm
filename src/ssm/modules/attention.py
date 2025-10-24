@@ -283,16 +283,19 @@ class MHA(nn.Module):
             inference_params is None
             or getattr(inference_params, "seqlen_offset", 0) == 0
         ):
-            conv_out = self.conv1d(qkv.transpose(1, 2))
+            qkv_t = qkv.transpose(1, 2)
+            conv_out = self.conv1d(qkv_t)
             if self.d_conv > 1:
                 conv_out = conv_out[..., : -(self.d_conv - 1)]
             conv_out = conv_out.transpose(1, 2).contiguous()
             if inference_params is not None:
                 _, conv_state = inference_params.key_value_memory_dict[self.layer_idx]
-                conv_t = conv_out.transpose(1, 2)
-                pad = self.d_conv - conv_t.shape[-1]
-                padded = F.pad(conv_t, (pad, 0))
-                conv_state.copy_(padded)
+                if qkv_t.shape[-1] >= self.d_conv:
+                    window = qkv_t[..., -self.d_conv :]
+                else:
+                    pad = self.d_conv - qkv_t.shape[-1]
+                    window = F.pad(qkv_t, (pad, 0))
+                conv_state.copy_(window)
             return conv_out
 
         _, conv_state = inference_params.key_value_memory_dict[self.layer_idx]

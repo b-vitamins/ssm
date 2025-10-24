@@ -25,6 +25,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ### Fixed
 - Corrected top-p nucleus sampling to retain the threshold token and added a regression test guarding against regressions.
 - Tightened the decode streamer typing to satisfy static analysis and prevent CI regressions.
+- Prevented fused attention Blocks from double-counting residuals and aligned depthwise attention cache initialization with
+  incremental decoding semantics.
 
 ## [0.1.0.dev0] - 2025-10-24
 ### Added
