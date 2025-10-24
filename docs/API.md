@@ -158,21 +158,28 @@ class MambaConfig:
     tie_embeddings: bool = True
 ```
 
-### ssm.models.lm.MixerInferenceParams
+### ssm.utils.generation.InferenceParams
 ```python
 @dataclass
-class MixerInferenceParams:
+class InferenceParams:
     max_seqlen: int
+    max_batch_size: int
+    seqlen_offset: int = 0
+    batch_size_offset: int = 0
     layer_states: dict[int, Any] = field(default_factory=dict)
     key_value_memory_dict: dict[int, Any] = field(default_factory=dict)
-    batch_size_offset: int = 0
-    seqlen_offset: int = 0
+    lengths_per_sample: torch.Tensor | None = None
+    legacy_cache: dict[str, Any] = field(default_factory=dict)
+
+    def reset(self, *, max_seqlen: int | None = None, max_batch_size: int | None = None) -> None: ...
+    def get(self, key: str, default: Any | None = None) -> Any: ...
 ```
 
-Container that mirrors the reference inference cache contract used by the upstream
-Mamba implementation. Per-layer SSM caches live in ``layer_states`` while attention
-layers populate ``key_value_memory_dict`` with KV tensors and optional convolution
-state.
+Container shared by the mixer backbone and generation helpers. Per-layer SSM
+caches live in ``layer_states`` while attention layers populate
+``key_value_memory_dict`` with KV tensors and optional convolution state. The
+``legacy_cache`` provides a compatibility view for dictionary-based caches used
+in lightweight tests, and ``reset`` reinitializes offsets and lengths before reuse.
 
 ### ssm.models.lm.MixerModel
 ```python
@@ -184,29 +191,32 @@ class MixerModel(nn.Module):
                  fused_add_norm: bool = False, residual_in_fp32: bool = False,
                  device=None, dtype=None) -> None: ...
     def allocate_inference_cache(self, batch_size: int, max_seqlen: int,
-                                 dtype: torch.dtype | None = None, **kwargs) -> MixerInferenceParams: ...
+                                 dtype: torch.dtype | None = None, **kwargs) -> InferenceParams: ...
     def forward(self, input_ids: torch.Tensor, *,
-                inference_params: MixerInferenceParams | None = None, **mixer_kwargs) -> torch.Tensor: ...
+                inference_params: InferenceParams | None = None, **mixer_kwargs) -> torch.Tensor: ...
 ```
 
 Mixer backbone mirroring the reference ``mamba_ssm`` layout. It embeds tokens,
 applies ``Block`` modules (each wrapping either an SSM or attention mixer plus an
 optional gated MLP), and finishes with a norm. ``allocate_inference_cache`` returns
-``MixerInferenceParams`` populated with per-layer caches so incremental generation
-can reuse state.
+an :class:`InferenceParams` instance populated with per-layer caches so incremental
+generation can reuse state and lengths.
 
 ### ssm.models.lm.MambaLMHeadModel
 ```python
 class MambaLMHeadModel(nn.Module):
     def __init__(self, config: MambaConfig, initializer_cfg: dict | None = None, device=None, dtype=None) -> None: ...
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor | None = None,
-                inference_params: MixerInferenceParams | None = None, num_last_tokens: int = 0,
+                inference_params: InferenceParams | None = None, num_last_tokens: int = 0,
                 **mixer_kwargs) -> CausalLMOutput: ...
     def allocate_inference_cache(self, batch_size: int, max_seqlen: int,
-                                 dtype: torch.dtype | None = None, **kwargs) -> MixerInferenceParams: ...
+                                 dtype: torch.dtype | None = None, **kwargs) -> InferenceParams: ...
     def generate(self, input_ids: torch.Tensor, max_length: int, top_k: int = 1, top_p: float = 0.0,
-                 min_p: float = 0.0, temperature: float = 1.0, return_dict_in_generate: bool = False,
-                 output_scores: bool = False, **kwargs): ...
+                 min_p: float = 0.0, temperature: float = 1.0, repetition_penalty: float = 1.0,
+                 eos_token_id: int | None = None, teacher_outputs: torch.Tensor | None = None,
+                 vocab_size: int | None = None, cg: bool = False, enable_timing: bool = False,
+                 return_dict_in_generate: bool = False, output_scores: bool = False,
+                 streamer: GenerationStreamer | None = None, **kwargs): ...
     @classmethod
     def from_pretrained(cls, pretrained_model_name: str | os.PathLike[str], *, device=None, dtype=None,
                         revision: str | None = None, token: str | None = None,
@@ -217,8 +227,10 @@ class MambaLMHeadModel(nn.Module):
 
 ``from_pretrained`` and ``save_pretrained`` use :mod:`ssm.utils.weights` helpers to
 interoperate with Hugging Face local directories or Hub checkpoints. Generation
-returns a tensor by default or ``GenerationOutput`` when ``return_dict_in_generate``
-is ``True``.
+supports greedy sampling, top-k/top-p/min-p sampling, repetition penalties,
+teacher forcing, optional CUDA graph capture, and prompt/token streaming. It
+returns a tensor by default or ``GenerationOutput`` when
+``return_dict_in_generate`` is ``True``.
 
 ## Ops (Python signatures)
 
@@ -236,5 +248,7 @@ Contracts
 - Shapes and dtype policies are documented in docstrings. All raise `NotImplementedError` until backends exist.
 
 ## Utils
-- Generation API mirrors a standard decode loop with CUDA graph support; initially raises `NotImplementedError`.
+- Generation provides ``InferenceParams`` for cache-aware decoding plus helpers for
+  streaming tokens, repetition penalties, sampling filters, and CUDA graph
+  capture via ``decode``.
 - Dispatch exposes backend detection: `has_cuda_kernels()`, `has_cpu_kernels()`, `get_available_backend()`.

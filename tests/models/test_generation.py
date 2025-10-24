@@ -5,7 +5,8 @@ from typing import Any
 import torch
 
 from ssm.models import MambaConfig, MambaLMHeadModel
-from ssm.models.lm import GenerationOutput, MixerInferenceParams
+from ssm.models.lm import GenerationOutput
+from ssm.utils.generation import InferenceParams
 from ssm.utils import generation as generation_utils
 
 
@@ -119,7 +120,7 @@ def test_allocate_inference_cache_with_attention():
         batch_size=2, max_seqlen=6, dtype=torch.float32
     )
 
-    assert isinstance(cache, MixerInferenceParams)
+    assert isinstance(cache, InferenceParams)
     assert cache.max_seqlen == 6
     assert 1 in cache.layer_states
     conv_state, ssm_state = cache.layer_states[1]

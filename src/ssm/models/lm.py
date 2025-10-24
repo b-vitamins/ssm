@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import namedtuple
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from functools import partial
 from typing import Any, Callable, Optional
 
@@ -16,6 +16,7 @@ from torch import nn
 from .config import MambaConfig
 from ..modules import Block, GatedMLP, MHA, Mamba1, Mamba2
 from ..utils import generation as generation_utils
+from ..utils.generation import InferenceParams
 from ..utils.weights import load_config_hf, load_state_dict_hf, save_pretrained_local
 
 try:  # pragma: no cover - optional fused kernels
@@ -42,25 +43,6 @@ class GenerationOutput:
 
     sequences: torch.Tensor
     scores: list[torch.Tensor] | None = None
-
-
-@dataclass
-class MixerInferenceParams:
-    """Inference cache container following the reference Mamba protocol.
-
-    Attributes:
-        max_seqlen: Maximum sequence length reserved in the cache.
-        layer_states: Mapping of layer index to mixer-specific cache tensors.
-        key_value_memory_dict: KV memory for attention layers keyed by index.
-        batch_size_offset: Offset used when decoding batches in chunks.
-        seqlen_offset: Current decoded length used to append new tokens.
-    """
-
-    max_seqlen: int
-    layer_states: dict[int, Any] = field(default_factory=dict)
-    key_value_memory_dict: dict[int, Any] = field(default_factory=dict)
-    batch_size_offset: int = 0
-    seqlen_offset: int = 0
 
 
 class _FallbackRMSNorm(nn.Module):
@@ -284,7 +266,7 @@ class MixerModel(nn.Module):
         max_seqlen: int,
         dtype: torch.dtype | None = None,
         **kwargs,
-    ) -> MixerInferenceParams:
+    ) -> InferenceParams:
         """Allocate per-layer caches for autoregressive decoding.
 
         Args:
@@ -294,7 +276,7 @@ class MixerModel(nn.Module):
             **kwargs: Forwarded to individual mixer cache builders.
 
         Returns:
-            MixerInferenceParams populated with layer-specific cache entries.
+            InferenceParams populated with layer-specific cache entries.
         """
 
         dtype = dtype or self.embedding.weight.dtype
@@ -312,17 +294,22 @@ class MixerModel(nn.Module):
                     layer_states[idx] = allocate(
                         batch_size, max_seqlen, dtype=dtype, **kwargs
                     )
-        return MixerInferenceParams(
+        lengths = torch.zeros(
+            batch_size, dtype=torch.int32, device=self.embedding.weight.device
+        )
+        return InferenceParams(
             max_seqlen=max_seqlen,
+            max_batch_size=batch_size,
             layer_states=layer_states,
             key_value_memory_dict=key_value_memory,
+            lengths_per_sample=lengths,
         )
 
     def forward(
         self,
         input_ids: torch.Tensor,
         *,
-        inference_params: MixerInferenceParams | None = None,
+        inference_params: InferenceParams | None = None,
         **mixer_kwargs,
     ) -> torch.Tensor:
         """Encode ``input_ids`` through the mixer stack.
@@ -476,7 +463,7 @@ class MambaLMHeadModel(nn.Module):
         max_seqlen: int,
         dtype: torch.dtype | None = None,
         **kwargs,
-    ) -> MixerInferenceParams:
+    ) -> InferenceParams:
         """Allocate caches required for incremental decoding.
 
         Args:
@@ -486,7 +473,7 @@ class MambaLMHeadModel(nn.Module):
             **kwargs: Forwarded to the backbone allocation routine.
 
         Returns:
-            MixerInferenceParams pre-populated with layer caches.
+            InferenceParams pre-populated with layer caches.
         """
 
         return self.backbone.allocate_inference_cache(
@@ -497,7 +484,7 @@ class MambaLMHeadModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor | None = None,
-        inference_params: MixerInferenceParams | None = None,
+        inference_params: InferenceParams | None = None,
         num_last_tokens: int = 0,
         **mixer_kwargs,
     ) -> CausalLMOutput:
@@ -603,8 +590,15 @@ class MambaLMHeadModel(nn.Module):
         top_p: float = 0.0,
         min_p: float = 0.0,
         temperature: float = 1.0,
+        repetition_penalty: float = 1.0,
+        eos_token_id: int | None = None,
+        teacher_outputs: torch.Tensor | None = None,
+        vocab_size: int | None = None,
+        cg: bool = False,
+        enable_timing: bool = False,
         return_dict_in_generate: bool = False,
         output_scores: bool = False,
+        streamer: generation_utils.GenerationStreamer | None = None,
         **kwargs,
     ):
         """Generate tokens via greedy or sampling-based decoding.
@@ -616,9 +610,16 @@ class MambaLMHeadModel(nn.Module):
             top_p: Top-p (nucleus) sampling parameter.
             min_p: Min-p sampling parameter.
             temperature: Softmax temperature applied to logits.
+            repetition_penalty: Penalize repeated tokens when sampling.
+            eos_token_id: Optional id that triggers early stop when generated.
+            teacher_outputs: Optional teacher forcing tokens per decode step.
+            vocab_size: Optional logits truncation size before sampling.
+            cg: Enable CUDA graph caching for compatible GPU execution.
+            enable_timing: If ``True``, capture simple timing breakdowns.
             return_dict_in_generate: If ``True``, return a :class:`GenerationOutput`.
             output_scores: If ``True``, include per-step logits in the output.
-            **kwargs: Additional generation options (e.g., ``eos_token_id``).
+            streamer: Optional callback invoked with prompt and sampled tokens.
+            **kwargs: Reserved for future extensions.
 
         Returns:
             Either a tensor of generated sequences or a tuple/``GenerationOutput``
@@ -629,79 +630,30 @@ class MambaLMHeadModel(nn.Module):
                 non-positive.
         """
 
-        if input_ids.dim() != 2:
-            raise ValueError("input_ids must have shape (batch, seqlen)")
-        if max_length <= 0:
-            raise ValueError("max_length must be positive")
-
-        batch_size, prompt_length = input_ids.shape
-        if max_length <= prompt_length:
-            sequences = input_ids[:, :max_length].clone()
-            scores = [] if output_scores else None
-            output = GenerationOutput(sequences=sequences, scores=scores)
-            if return_dict_in_generate:
-                return output
-            if output_scores:
-                return sequences, scores
-            return sequences
-
-        steps = max_length - prompt_length
-        scores: list[torch.Tensor] | None = [] if output_scores else None
-        sequences = input_ids.clone()
-        eos_token_id = kwargs.get("eos_token_id")
-        cache = self.allocate_inference_cache(
-            batch_size=batch_size,
-            max_seqlen=max_length,
-            dtype=next(self.parameters()).dtype,
+        decode_output = generation_utils.decode(
+            input_ids=input_ids,
+            model=self,
+            max_length=max_length,
+            top_k=top_k,
+            top_p=top_p,
+            min_p=min_p,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
+            eos_token_id=eos_token_id,
+            teacher_outputs=teacher_outputs,
+            vocab_size=vocab_size,
+            cg=cg,
+            enable_timing=enable_timing,
+            output_scores=output_scores,
+            streamer=streamer,
+            **kwargs,
         )
-        was_training = self.training
-        finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
 
-        try:
-            self.eval()
-            with torch.no_grad():
-                outputs = self.forward(
-                    sequences,
-                    inference_params=cache,
-                    num_last_tokens=1,
-                )
-                logits = outputs.logits[:, -1, :]
-                for _ in range(steps):
-                    if scores is not None:
-                        scores.append(logits.clone())
-                    next_tokens = generation_utils.sample_from_logits(
-                        logits,
-                        top_k=top_k,
-                        top_p=top_p,
-                        min_p=min_p,
-                        temperature=temperature,
-                    )
-                    if eos_token_id is not None:
-                        next_tokens = next_tokens.masked_fill(finished, eos_token_id)
-                    sequences = torch.cat(
-                        [sequences, next_tokens.unsqueeze(-1)], dim=-1
-                    )
-                    if sequences.size(1) >= max_length:
-                        if eos_token_id is not None:
-                            finished = finished | (next_tokens == eos_token_id)
-                        break
-                    if eos_token_id is not None:
-                        finished = finished | (next_tokens == eos_token_id)
-                        if finished.all():
-                            break
-                    outputs = self.forward(
-                        next_tokens.unsqueeze(-1),
-                        inference_params=cache,
-                        num_last_tokens=1,
-                    )
-                    logits = outputs.logits[:, -1, :]
-        finally:
-            if was_training:
-                self.train()
-
-        generation_output = GenerationOutput(sequences=sequences, scores=scores)
+        output = GenerationOutput(
+            sequences=decode_output.sequences, scores=decode_output.scores
+        )
         if return_dict_in_generate:
-            return generation_output
+            return output
         if output_scores:
-            return sequences, scores
-        return sequences
+            return output.sequences, output.scores
+        return output.sequences

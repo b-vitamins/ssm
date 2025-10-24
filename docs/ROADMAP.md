@@ -16,6 +16,8 @@ This roadmap outlines milestones for implementing SSM Core on top of the scaffol
   - fused_layer_norm
 - Wire modules to reference ops.
 - Enable end-to-end generation using reference ops.
+- Add streaming decode helpers, repetition penalties, and CUDA graph hooks to
+  the reference generation stack.
 - Generate and commit small golden datasets from reference for core op cases.
 
 ## Phase 2 — CPU Fused Kernels
