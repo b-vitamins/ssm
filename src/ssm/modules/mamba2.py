@@ -9,6 +9,14 @@ from torch.nn import functional as F
 from ssm import ops
 
 
+def _compute_dtype(tensor: torch.Tensor) -> torch.dtype:
+    """Return the accumulation dtype for a given tensor."""
+
+    if tensor.dtype in (torch.float16, torch.bfloat16):
+        return torch.float32
+    return tensor.dtype
+
+
 class Mamba2(nn.Module):
     """State Space Dual (Mamba v2) block implemented with reference ops.
 
@@ -108,12 +116,18 @@ class Mamba2(nn.Module):
         )
         self.dt_proj_bias = nn.Parameter(torch.zeros(self.nheads, **factory_kwargs))
         self.A_log = nn.Parameter(torch.zeros(self.nheads, headdim, **factory_kwargs))
-        self.B = nn.Parameter(torch.randn(self.nheads, headdim, **factory_kwargs) * 0.02)
-        self.C = nn.Parameter(torch.randn(self.nheads, headdim, **factory_kwargs) * 0.02)
+        self.B = nn.Parameter(
+            torch.randn(self.nheads, headdim, **factory_kwargs) * 0.02
+        )
+        self.C = nn.Parameter(
+            torch.randn(self.nheads, headdim, **factory_kwargs) * 0.02
+        )
         self.D = nn.Parameter(torch.ones(self.nheads, headdim, **factory_kwargs))
 
         if self.mlp_dim > 0:
-            self.mlp = nn.Linear(self.mlp_dim, self.mlp_dim, bias=bias, **factory_kwargs)
+            self.mlp = nn.Linear(
+                self.mlp_dim, self.mlp_dim, bias=bias, **factory_kwargs
+            )
         else:
             self.register_module("mlp", None)
 
@@ -137,35 +151,45 @@ class Mamba2(nn.Module):
 
         batch, seqlen, _ = hidden_states.shape
 
+        compute_dtype = _compute_dtype(hidden_states)
+
         projected = self.in_proj(hidden_states)
+        gate = torch.sigmoid(self.gate_proj(hidden_states)).to(compute_dtype)
+
         conv_input = projected.permute(0, 2, 1)
-        conv_out = ops.dw_causal_conv(
+        conv_out_cf = ops.dw_causal_conv(
             conv_input,
             self.conv_weight,
             bias=self.conv_bias,
             activation="silu",
-        ).permute(0, 2, 1)
+        ).to(compute_dtype)
 
-        gate = torch.sigmoid(self.gate_proj(hidden_states))
-
+        lengths_tensor: torch.Tensor | None = None
         if self.ssm_dim > 0:
-            ssm_in = conv_out[..., : self.ssm_dim]
-            X = ssm_in.view(batch, seqlen, self.ssm_heads, self.headdim)
+            ssm_cf = conv_out_cf[:, : self.ssm_dim].contiguous()
+            ssm_heads = ssm_cf.view(batch, self.ssm_heads, self.headdim, seqlen)
+            X = ssm_heads.permute(0, 3, 1, 2).contiguous()
             dt = torch.einsum(
-                "blhp,hp->blh", X, self.dt_proj_weight[: self.ssm_heads]
-            ) + self.dt_proj_bias[: self.ssm_heads]
-            dt = F.softplus(dt)
+                "bhpl,hp->bhl",
+                ssm_heads.to(compute_dtype),
+                self.dt_proj_weight[: self.ssm_heads].to(compute_dtype),
+            )
+            dt = dt + self.dt_proj_bias[: self.ssm_heads].to(compute_dtype).view(
+                1, self.ssm_heads, 1
+            )
+            dt = F.softplus(dt.transpose(1, 2))
 
             seq_meta = None
-            lengths_tensor: torch.Tensor | None = None
             if seq_lens is not None:
-                lengths_tensor = seq_lens.to(dtype=torch.long, device=hidden_states.device)
+                lengths_tensor = seq_lens.to(
+                    dtype=torch.long, device=hidden_states.device
+                )
                 seq_meta = {"seq_lens": lengths_tensor.tolist()}
 
             ssm_out = ops.ssd_chunk_scan(
                 X=X,
                 dt=dt,
-                A=-torch.exp(self.A_log[: self.ssm_heads]),
+                A=-torch.exp(self.A_log[: self.ssm_heads].to(compute_dtype)),
                 B=self.B[: self.ssm_heads],
                 C=self.C[: self.ssm_heads],
                 chunk_size=self.chunk_size,
@@ -173,31 +197,35 @@ class Mamba2(nn.Module):
                 z=None,
                 seq_meta=seq_meta,
             )
-            ssm_out = ssm_out.view(batch, seqlen, self.ssm_dim)
+            ssm_out = ssm_out.view(batch, seqlen, self.ssm_dim).to(compute_dtype)
         else:
-            ssm_out = hidden_states.new_zeros(batch, seqlen, 0)
-            lengths_tensor = seq_lens.to(dtype=torch.long, device=hidden_states.device) if seq_lens is not None else None
+            ssm_out = hidden_states.new_zeros(batch, seqlen, 0).to(compute_dtype)
+            if seq_lens is not None:
+                lengths_tensor = seq_lens.to(
+                    dtype=torch.long, device=hidden_states.device
+                )
 
         if self.mlp_dim > 0:
-            mlp_in = conv_out[..., self.ssm_dim :]
-            mlp_out = F.silu(self.mlp(mlp_in))
+            mlp_cf = conv_out_cf[:, self.ssm_dim :]
+            mlp_in = mlp_cf.permute(0, 2, 1).to(self.mlp.weight.dtype)
+            mlp_proj = self.mlp(mlp_in)
+            mlp_out = F.silu(mlp_proj).to(compute_dtype)
         else:
-            mlp_out = hidden_states.new_zeros(batch, seqlen, 0)
+            mlp_out = hidden_states.new_zeros(batch, seqlen, 0).to(compute_dtype)
 
-        combined = torch.cat([ssm_out, mlp_out], dim=-1)
+        combined = torch.cat([ssm_out.to(compute_dtype), mlp_out], dim=-1)
         combined = combined * gate
 
         if seq_lens is not None:
             assert lengths_tensor is not None
-            mask = (
-                torch.arange(seqlen, device=hidden_states.device)
-                .unsqueeze(0)
-                .expand(batch, seqlen)
-                < lengths_tensor.unsqueeze(1)
-            )
-            combined = combined * mask.unsqueeze(-1)
+            mask = torch.arange(seqlen, device=hidden_states.device).unsqueeze(
+                0
+            ).expand(batch, seqlen) < lengths_tensor.unsqueeze(1)
+            combined = combined * mask.unsqueeze(-1).to(combined.dtype)
 
-        return self.out_proj(combined)
+        proj_input = combined.to(self.out_proj.weight.dtype)
+        projected = self.out_proj(proj_input)
+        return projected.to(hidden_states.dtype)
 
     def forward(
         self,
@@ -243,12 +271,18 @@ class Mamba2(nn.Module):
         def _normalize_seq_idx(idx: torch.Tensor) -> torch.Tensor:
             if idx.ndim == 2:
                 if idx.shape[0] != 1:
-                    raise ValueError("seq_idx must broadcast with the flattened batch dimension.")
+                    raise ValueError(
+                        "seq_idx must broadcast with the flattened batch dimension."
+                    )
                 idx = idx[0]
             if idx.ndim != 1:
-                raise ValueError("seq_idx must be rank-1 (or (1, T) for cu_seqlens routing).")
+                raise ValueError(
+                    "seq_idx must be rank-1 (or (1, T) for cu_seqlens routing)."
+                )
             if idx.numel() != total_tokens:
-                raise ValueError("seq_idx must have the same number of tokens as hidden_states.")
+                raise ValueError(
+                    "seq_idx must have the same number of tokens as hidden_states."
+                )
             idx = idx.to(device=hidden_states.device, dtype=torch.long)
             if torch.any(idx < 0) or torch.any(idx >= batch):
                 raise ValueError("seq_idx entries must index sequences in [0, B).")
@@ -280,7 +314,9 @@ class Mamba2(nn.Module):
         cursor = 0
         for b, length in enumerate(seq_lens.tolist()):
             if length == 0:
-                scatter_positions.append(torch.empty(0, dtype=torch.long, device=hidden_states.device))
+                scatter_positions.append(
+                    torch.empty(0, dtype=torch.long, device=hidden_states.device)
+                )
                 continue
             if seq_idx is None:
                 positions = torch.arange(
@@ -292,7 +328,9 @@ class Mamba2(nn.Module):
             else:
                 positions = (seq_idx == b).nonzero(as_tuple=False).squeeze(-1)
                 if positions.numel() != length:
-                    raise ValueError("seq_idx counts must agree with cu_seqlens lengths.")
+                    raise ValueError(
+                        "seq_idx counts must agree with cu_seqlens lengths."
+                    )
             padded[b, :length] = flat.index_select(0, positions)
             scatter_positions.append(positions)
             if seq_idx is None:
@@ -355,4 +393,3 @@ class Mamba2(nn.Module):
             dtype=cache_dtype,
         )
         return {"conv_state": conv_state, "ssd_state": ssd_state}
-

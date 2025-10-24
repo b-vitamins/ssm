@@ -37,6 +37,12 @@ Ops expose a single `torch.autograd.Function`-backed surface per op. Different b
 - Parameters impacting recurrent stability (e.g., A, D, dt_bias) are stored/accumulated in fp32; outputs returned in the requested mixed precision.
 - Exponentials and softplus performed in fp32.
 
+### Layout & Accumulation Policy
+
+- Mamba blocks minimise redundant layout conversions by keeping depthwise-convolution buffers in channel-first layout where the downstream ops benefit, materialising channel-last views only when projections require them.
+- State-space projections are evaluated in fp32 via explicit casting before `torch.exp`, `torch.einsum`, or chunked scans to preserve numerical stability when modules run under autocast/bfloat16.
+- Linear layers that must consume channel-last tensors cast their inputs to the parameter dtype before the projection, while the surrounding math continues in fp32. Outputs are converted back to the caller's dtype after the final projection to preserve module-level dtype semantics.
+
 ### Variable Length Handling (Mamba2/SSD)
 
 - Varlen inputs represented via `seq_meta` (e.g., `seq_idx`, `cu_seqlens`, masks). Kernels interpret these to process ragged batches.
