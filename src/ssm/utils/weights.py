@@ -38,7 +38,7 @@ def _resolve_directory(
         return model_path
 
     try:
-        from huggingface_hub import snapshot_download
+        from huggingface_hub import snapshot_download  # pyright: ignore[reportMissingImports]
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise RuntimeError(
             "huggingface_hub is required to download remote checkpoints"

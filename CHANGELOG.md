@@ -6,6 +6,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 ### Added
+- Enabled cached prefill/decode flows for the reference Mamba1 and Mamba2 blocks with
+  regression tests covering dense and ragged stepping.
 - Mixer-style language model backbone with optional attention, Hugging Face
   save/load helpers, updated docs, and expanded generation tests.
 - Implemented the hybrid block, multi-head attention (with cache/conv support), and gated MLP modules with docs and unit tests.

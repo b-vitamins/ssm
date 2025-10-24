@@ -4,6 +4,7 @@ from typing import Any, cast
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from ssm import ops
 
@@ -144,6 +145,13 @@ class Mamba1(nn.Module):
         if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.d_model:
             raise ValueError("hidden_states must have shape (B, L, d_model).")
 
+        if isinstance(inference_params, tuple):
+            conv_state, ssm_state = inference_params
+            return self._step_tokens(hidden_states, conv_state, ssm_state)
+
+        if inference_params is not None:
+            return self._forward_cached(hidden_states, inference_params)
+
         projected, gate = self.in_proj(hidden_states).chunk(2, dim=-1)
         projected = cast(torch.Tensor, projected)
         gate = cast(torch.Tensor, gate)
@@ -183,6 +191,115 @@ class Mamba1(nn.Module):
         proj_input = output.to(self.out_proj.weight.dtype)
         projected_out = self.out_proj(proj_input)
         return projected_out.to(hidden_states.dtype)
+
+    def _forward_cached(
+        self, hidden_states: torch.Tensor, inference_params
+    ) -> torch.Tensor:
+        if self.layer_idx is None:
+            raise RuntimeError("inference requires layer_idx to be set")
+        if not hasattr(inference_params, "key_value_memory_dict"):
+            inference_params.key_value_memory_dict = {}
+        cache_dict = inference_params.key_value_memory_dict
+        batch = hidden_states.shape[0]
+        batch_start = getattr(inference_params, "batch_size_offset", 0)
+        batch_end = batch_start + batch
+        target_batch = max(batch_end, 0)
+        cache = cache_dict.get(self.layer_idx)
+        if (
+            cache is None
+            or cache[0].shape[0] < target_batch
+            or cache[1].shape[0] < target_batch
+        ):
+            cache = self.allocate_inference_cache(
+                batch_size=target_batch,
+                max_seqlen=getattr(
+                    inference_params,
+                    "max_seqlen",
+                    hidden_states.shape[1],
+                ),
+                dtype=hidden_states.dtype,
+            )
+            cache_dict[self.layer_idx] = cache
+
+        conv_cache, ssm_cache = cache
+        conv_slice = conv_cache[batch_start:batch_end]
+        ssm_slice = ssm_cache[batch_start:batch_end]
+
+        return self._step_tokens(hidden_states, conv_slice, ssm_slice)
+
+    def _step_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+    ) -> torch.Tensor:
+        if hidden_states.shape[1] == 0:
+            return hidden_states.new_zeros(
+                hidden_states.shape[0], 0, hidden_states.shape[-1]
+            )
+
+        outputs: list[torch.Tensor] = []
+        for t in range(hidden_states.shape[1]):
+            token = hidden_states[:, t : t + 1]
+            out, _, _ = self.step(token, conv_state, ssm_state)
+            outputs.append(out)
+        return torch.cat(outputs, dim=1)
+
+    def step(
+        self,
+        hidden_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if hidden_states.ndim != 3 or hidden_states.shape[1] != 1:
+            raise ValueError("step expects inputs of shape (B, 1, d_model)")
+
+        batch = hidden_states.shape[0]
+        if conv_state.shape[0] != batch or conv_state.shape[1] != self.inner_dim:
+            raise ValueError("conv_state shape does not match batch or inner dim")
+        if ssm_state.shape[0] != batch or ssm_state.shape[1] != self.inner_dim:
+            raise ValueError("ssm_state shape does not match batch or inner dim")
+
+        projected, gate = self.in_proj(hidden_states).chunk(2, dim=-1)
+        projected = projected.squeeze(1)
+        gate = gate.squeeze(1)
+
+        compute_dtype = _compute_dtype(hidden_states)
+
+        conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
+        conv_state[:, :, -1] = projected.to(conv_state.dtype)
+
+        conv_history = conv_state.to(compute_dtype)
+        kernel = self.conv_weight.to(compute_dtype).view(1, self.inner_dim, self.d_conv)
+        conv_out = (conv_history * kernel).sum(dim=-1)
+        if self.conv_bias is not None:
+            conv_out = conv_out + self.conv_bias.to(compute_dtype)
+        conv_out = F.silu(conv_out)
+
+        delta = F.linear(
+            conv_out,
+            self.dt_proj.weight.to(compute_dtype),
+            self.dt_proj.bias.to(compute_dtype),
+        )
+        A = -torch.exp(self.A_log.to(compute_dtype))
+        z = gate.to(compute_dtype)
+
+        output = ops.selective_state_step(
+            ssm_state,
+            conv_out,
+            delta,
+            A,
+            self.B,
+            self.C,
+            self.D,
+            z=z,
+            dt_bias=self.dt_bias,
+            softplus=True,
+        )
+
+        proj_input = output.to(self.out_proj.weight.dtype)
+        projected_out = self.out_proj(proj_input)
+        return projected_out.unsqueeze(1).to(hidden_states.dtype), conv_state, ssm_state
 
     def allocate_inference_cache(
         self,

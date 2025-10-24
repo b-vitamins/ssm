@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -250,11 +250,23 @@ class Mamba2(nn.Module):
             torch.Tensor: Output tensor matching the layout of ``hidden_states``.
 
         Raises:
-            NotImplementedError: If ``inference_params`` is supplied.
             ValueError: If the provided routing metadata is invalid for the given inputs.
         """
+        if isinstance(inference_params, dict):
+            return self._forward_with_cache_dict(
+                hidden_states,
+                inference_params,
+                seq_idx=seq_idx,
+                cu_seqlens=cu_seqlens,
+            )
+
         if inference_params is not None:
-            raise NotImplementedError("Inference cache stepping is not implemented.")
+            return self._forward_inference(
+                hidden_states,
+                inference_params,
+                seq_idx=seq_idx,
+                cu_seqlens=cu_seqlens,
+            )
 
         if cu_seqlens is None:
             if seq_idx is not None:
@@ -393,3 +405,282 @@ class Mamba2(nn.Module):
             dtype=cache_dtype,
         )
         return {"conv_state": conv_state, "ssd_state": ssd_state}
+
+    def _forward_with_cache_dict(
+        self,
+        hidden_states: torch.Tensor,
+        cache: dict[str, torch.Tensor],
+        *,
+        seq_idx: torch.Tensor | None,
+        cu_seqlens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        conv_state = cache["conv_state"]
+        ssd_state = cache["ssd_state"]
+        if cu_seqlens is None:
+            return self._step_dense_tokens(hidden_states, conv_state, ssd_state)
+        return self._step_varlen_tokens(
+            hidden_states,
+            cu_seqlens,
+            seq_idx,
+            conv_state,
+            ssd_state,
+        )
+
+    def _forward_inference(
+        self,
+        hidden_states: torch.Tensor,
+        inference_params,
+        *,
+        seq_idx: torch.Tensor | None,
+        cu_seqlens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.layer_idx is None:
+            raise RuntimeError("inference requires layer_idx to be set")
+        if not hasattr(inference_params, "key_value_memory_dict"):
+            inference_params.key_value_memory_dict = {}
+        cache_dict = cast(
+            dict[int, dict[str, torch.Tensor]],
+            inference_params.key_value_memory_dict,
+        )
+
+        if cu_seqlens is None:
+            if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.d_model:
+                raise ValueError("hidden_states must have shape (B, L, d_model).")
+            batch = hidden_states.shape[0]
+        else:
+            if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+                raise ValueError("cu_seqlens must be a 1-D tensor of length B + 1.")
+            batch = cu_seqlens.numel() - 1
+
+        batch_start = getattr(inference_params, "batch_size_offset", 0)
+        batch_end = batch_start + batch
+        target_batch = max(batch_end, 0)
+
+        cache = cache_dict.get(self.layer_idx)
+        if cache is None or (
+            cache["conv_state"].shape[0] < target_batch
+            or cache["ssd_state"].shape[0] < target_batch
+        ):
+            cache = self.allocate_inference_cache(
+                batch_size=target_batch,
+                max_seqlen=getattr(
+                    inference_params,
+                    "max_seqlen",
+                    hidden_states.shape[1] if hidden_states.ndim == 3 else 1,
+                ),
+                dtype=hidden_states.dtype,
+            )
+            cache_dict[self.layer_idx] = cache
+
+        conv_cache = cache["conv_state"]
+        ssd_cache = cache["ssd_state"]
+        conv_slice = conv_cache[batch_start:batch_end]
+        ssd_slice = ssd_cache[batch_start:batch_end]
+
+        if cu_seqlens is None:
+            return self._step_dense_tokens(hidden_states, conv_slice, ssd_slice)
+
+        return self._step_varlen_tokens(
+            hidden_states,
+            cu_seqlens,
+            seq_idx,
+            conv_slice,
+            ssd_slice,
+        )
+
+    def _step_dense_tokens(
+        self,
+        tokens: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssd_state: torch.Tensor,
+    ) -> torch.Tensor:
+        if tokens.shape[1] == 0:
+            return tokens.new_zeros(tokens.shape[0], 0, self.d_model)
+        outputs: list[torch.Tensor] = []
+        for t in range(tokens.shape[1]):
+            out, _, _ = self.step(tokens[:, t : t + 1], conv_state, ssd_state)
+            outputs.append(out)
+        return torch.cat(outputs, dim=1)
+
+    def _step_varlen_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        seq_idx: torch.Tensor | None,
+        conv_state: torch.Tensor,
+        ssd_state: torch.Tensor,
+    ) -> torch.Tensor:
+        seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
+        batch = seq_lens.numel()
+        total_tokens = int(seq_lens.sum().item())
+
+        if hidden_states.ndim == 3 and hidden_states.shape[0] == batch:
+            if seq_idx is not None:
+                raise ValueError(
+                    "seq_idx cannot be provided with dense varlen hidden_states."
+                )
+            max_len = hidden_states.shape[1]
+            outputs = hidden_states.new_zeros(batch, max_len, self.d_model)
+            for b, length in enumerate(seq_lens.tolist()):
+                if length == 0:
+                    continue
+                seq_tokens = hidden_states[b : b + 1, :length]
+                seq_out = self._step_dense_tokens(
+                    seq_tokens, conv_state[b : b + 1], ssd_state[b : b + 1]
+                )
+                outputs[b, :length] = seq_out[0]
+            return outputs
+
+        if hidden_states.ndim == 3 and hidden_states.shape[0] == 1:
+            flat = hidden_states[0]
+            keep_batch_dim = True
+        elif hidden_states.ndim == 2:
+            flat = hidden_states
+            keep_batch_dim = False
+        else:
+            raise ValueError(
+                "Unsupported hidden_states layout for varlen routing with cache."
+            )
+
+        if flat.shape[0] != total_tokens:
+            raise ValueError("Flattened tokens must match cu_seqlens total length.")
+
+        device = hidden_states.device
+
+        def _normalize_seq_idx(idx: torch.Tensor) -> torch.Tensor:
+            if idx.ndim == 2:
+                if idx.shape[0] != 1:
+                    raise ValueError(
+                        "seq_idx must broadcast with the flattened batch dimension."
+                    )
+                idx = idx[0]
+            if idx.ndim != 1:
+                raise ValueError(
+                    "seq_idx must be rank-1 (or (1, T) for cu_seqlens routing)."
+                )
+            if idx.numel() != total_tokens:
+                raise ValueError(
+                    "seq_idx must have the same number of tokens as hidden_states."
+                )
+            idx = idx.to(device=device, dtype=torch.long)
+            if torch.any(idx < 0) or torch.any(idx >= batch):
+                raise ValueError("seq_idx entries must index sequences in [0, B).")
+            return idx
+
+        positions: list[torch.Tensor] = []
+        if seq_idx is None:
+            cursor = 0
+            for length in seq_lens.tolist():
+                pos = torch.arange(
+                    cursor,
+                    cursor + length,
+                    device=device,
+                    dtype=torch.long,
+                )
+                positions.append(pos)
+                cursor += length
+        else:
+            seq_idx = _normalize_seq_idx(seq_idx)
+            for b, length in enumerate(seq_lens.tolist()):
+                pos = (seq_idx == b).nonzero(as_tuple=False).squeeze(-1)
+                if pos.numel() != length:
+                    raise ValueError(
+                        "seq_idx counts must agree with cu_seqlens lengths."
+                    )
+                positions.append(pos)
+
+        flat_out = flat.new_zeros(total_tokens, self.d_model)
+        for b, length in enumerate(seq_lens.tolist()):
+            if length == 0:
+                continue
+            pos = positions[b]
+            seq_tokens = flat.index_select(0, pos).unsqueeze(0)
+            seq_out = self._step_dense_tokens(
+                seq_tokens, conv_state[b : b + 1], ssd_state[b : b + 1]
+            )
+            flat_out.index_copy_(0, pos, seq_out.squeeze(0))
+
+        if keep_batch_dim:
+            return flat_out.unsqueeze(0)
+        return flat_out
+
+    def step(
+        self,
+        hidden_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssd_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if hidden_states.ndim != 3 or hidden_states.shape[1] != 1:
+            raise ValueError("step expects inputs of shape (B, 1, d_model)")
+
+        batch = hidden_states.shape[0]
+        if conv_state.shape[0] != batch or conv_state.shape[1] != self.inner_dim:
+            raise ValueError("conv_state shape does not match batch or inner dim")
+        if ssd_state.shape[0] != batch or ssd_state.shape[1] != self.ssm_heads:
+            raise ValueError("ssd_state shape does not match batch or head count")
+
+        compute_dtype = _compute_dtype(hidden_states)
+
+        projected = self.in_proj(hidden_states).squeeze(1)
+        gate = torch.sigmoid(self.gate_proj(hidden_states)).squeeze(1)
+
+        conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
+        conv_state[:, :, -1] = projected.to(conv_state.dtype)
+
+        conv_hist = conv_state.to(compute_dtype)
+        kernel = self.conv_weight.to(compute_dtype).view(1, self.inner_dim, self.d_conv)
+        conv_out = (conv_hist * kernel).sum(dim=-1)
+        if self.conv_bias is not None:
+            conv_out = conv_out + self.conv_bias.to(compute_dtype)
+        conv_out = F.silu(conv_out)
+
+        if self.ssm_dim > 0:
+            ssm_drive = conv_out[:, : self.ssm_dim].view(
+                batch, self.ssm_heads, self.headdim
+            )
+            dt_raw = torch.einsum(
+                "bhp,hp->bh",
+                ssm_drive.to(compute_dtype),
+                self.dt_proj_weight[: self.ssm_heads].to(compute_dtype),
+            )
+            dt = F.softplus(
+                dt_raw + self.dt_proj_bias[: self.ssm_heads].to(compute_dtype)
+            )
+
+            decay = torch.exp(
+                dt.unsqueeze(-1)
+                * -torch.exp(self.A_log[: self.ssm_heads].to(compute_dtype))
+            )
+
+            drive = self.B[: self.ssm_heads].to(compute_dtype) * ssm_drive.to(
+                compute_dtype
+            )
+
+            state_compute = ssd_state.to(compute_dtype)
+            new_state = decay * state_compute + dt.unsqueeze(-1) * drive
+            ssd_state.copy_(new_state.to(ssd_state.dtype))
+
+            proj = self.C[: self.ssm_heads].to(compute_dtype)
+            ssm_out_heads = new_state * proj
+            if self.D is not None:
+                ssm_out_heads = ssm_out_heads + (
+                    self.D[: self.ssm_heads].to(compute_dtype)
+                    * ssm_drive.to(compute_dtype)
+                )
+            ssm_out = ssm_out_heads.reshape(batch, self.ssm_dim)
+        else:
+            ssm_out = conv_out.new_zeros(batch, 0)
+
+        if self.mlp_dim > 0:
+            mlp_drive = conv_out[:, self.ssm_dim :]
+            mlp_proj = self.mlp(mlp_drive.to(self.mlp.weight.dtype))
+            mlp_out = F.silu(mlp_proj).to(compute_dtype)
+        else:
+            mlp_out = conv_out.new_zeros(batch, 0)
+
+        combined = torch.cat([ssm_out.to(compute_dtype), mlp_out], dim=-1)
+        combined = combined * gate.to(compute_dtype)
+
+        proj_input = combined.to(self.out_proj.weight.dtype)
+        projected_out = self.out_proj(proj_input)
+        return projected_out.unsqueeze(1).to(hidden_states.dtype), conv_state, ssd_state
