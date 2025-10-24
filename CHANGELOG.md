@@ -9,6 +9,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Autograd-enabled CUDA dispatch for selective scan, state step, SSD chunk scan,
   depthwise causal convolution, and fused layer norm with reference-validated
   gradients and expanded GPU tests.
+- SSD chunk scan stress coverage comparing the fused CPU kernel against the
+  reference path across long and ragged sequence configurations.
 - Hugging Face Hub checkpoint resolution backed by ``cached_file`` with dtype
   remapping support, updated language model helpers, docs, and unit tests.
 - Expanded generation helpers with reusable inference parameter management,
@@ -27,6 +29,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - CUDA kernels and bindings for selective scan, selective state step, SSD chunk scan, depthwise causal convolution, and fused layer norm with GPU-dispatch integration and CUDA-focused tests.
 - Stress tests that cover long sequences, high state dimensions, grouped parameters, and mixed-precision execution paths under `tests/stress/`.
 ### Changed
+- Reworked the CPU SSD chunk scan kernel with chunk-level threading, contiguous
+  traversal, and vectorized math aligned with the upstream chunk-tiling logic.
 - Optimized the CPU selective state step kernel with vectorized inner loops and grouped projection row views to match the upstream fused update semantics.
 - Documented the required developer workflow to install dependencies on session start and to run `ruff`, `pyright`, and `pytest` before opening pull requests.
 - Expanded the contributor workflow to mandate running `ruff format .` before linting and tests, aligning local practice with CI.
