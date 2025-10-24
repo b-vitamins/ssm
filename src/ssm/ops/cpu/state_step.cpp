@@ -1,48 +1,13 @@
 #include "common.h"
 
 #include <ATen/ATen.h>
+#include <ATen/Parallel.h>
+
+#include <cmath>
+#include <complex>
 
 namespace ssm {
 namespace cpu {
-
-namespace {
-
-at::Tensor normalize_scan_param_single(const std::string& name,
-                                       const at::Tensor& param, int64_t batch,
-                                       int64_t dim, int64_t state_dim,
-                                       at::ScalarType dtype,
-                                       const at::Device& device) {
-  if (param.dim() == 2) {
-    TORCH_CHECK(param.size(0) == dim && param.size(1) == state_dim,
-                name, " must have shape (D, N).");
-    return to_compute(param, dtype, device)
-        .view({1, dim, state_dim});
-  }
-  if (param.dim() == 3) {
-    TORCH_CHECK(param.size(0) == batch, name,
-                " must have shape (B, D, N) when 3-D.");
-    if (param.size(1) != dim || param.size(2) != state_dim) {
-      TORCH_CHECK(false, name, " must have shape (B, D, N) when 3-D.");
-    }
-    return to_compute(param, dtype, device);
-  }
-  TORCH_CHECK(false, "Unsupported rank for ", name, ".");
-}
-
-at::Tensor maybe_expand_grouped(const std::string& name,
-                                const at::Tensor& param, int64_t dim,
-                                int64_t state_dim) {
-  if (param.dim() == 3 && param.size(1) != dim) {
-    auto groups = param.size(1);
-    TORCH_CHECK(dim % groups == 0, name, " group dimension must divide D.");
-    TORCH_CHECK(param.size(2) == state_dim, name,
-                " must have matching state dimension.");
-    return param.repeat_interleave(dim / groups, 1);
-  }
-  return param;
-}
-
-}  // namespace
 
 at::Tensor selective_state_step_cpu(
     at::Tensor state, const at::Tensor& x, const at::Tensor& dt,
@@ -71,36 +36,10 @@ at::Tensor selective_state_step_cpu(
 
   const auto device = state.device();
 
-  auto state_compute = to_compute(state, compute_dtype, device);
-  auto x_compute = to_compute(x, compute_dtype, device);
+  auto state_compute = to_compute(state, compute_dtype, device).contiguous();
+  auto x_compute = to_compute(x, compute_dtype, device).contiguous();
   auto dt_compute = to_compute(dt, compute_dtype, device);
-  auto A_compute = to_compute(A, compute_dtype, device);
-
-  auto B_prepared = maybe_expand_grouped("B", B, dim, state_dim);
-  auto C_prepared = maybe_expand_grouped("C", C, dim, state_dim);
-
-  auto B_expanded = normalize_scan_param_single("B", B_prepared, batch, dim,
-                                                state_dim, compute_dtype,
-                                                device);
-  auto C_expanded = normalize_scan_param_single("C", C_prepared, batch, dim,
-                                                state_dim, compute_dtype,
-                                                device);
-
-  c10::optional<at::Tensor> D_compute = c10::nullopt;
-  if (D.has_value()) {
-    const auto& tensor = D.value();
-    TORCH_CHECK(tensor.dim() == 1 && tensor.size(0) == dim,
-                "D must have shape (D,).");
-    D_compute = to_compute(tensor, compute_dtype, device);
-  }
-
-  c10::optional<at::Tensor> z_compute = c10::nullopt;
-  if (z.has_value()) {
-    const auto& tensor = z.value();
-    TORCH_CHECK(tensor.dim() == 2 && tensor.sizes() == x.sizes(),
-                "z must have shape (B, D).");
-    z_compute = to_compute(tensor, compute_dtype, device);
-  }
+  auto A_compute = to_compute(A, compute_dtype, device).contiguous();
 
   if (dt_bias.has_value()) {
     const auto& tensor = dt_bias.value();
@@ -114,22 +53,109 @@ at::Tensor selective_state_step_cpu(
     dt_compute = at::softplus(dt_compute);
   }
 
-  auto decay = (dt_compute.unsqueeze(-1) * A_compute.unsqueeze(0)).exp();
-  auto drive = B_expanded * x_compute.unsqueeze(-1);
-  auto new_state = decay * state_compute + dt_compute.unsqueeze(-1) * drive;
+  dt_compute = dt_compute.contiguous();
 
-  auto output = (new_state * C_expanded).sum(-1);
+  auto maybe_group = [&](const std::string& name, const at::Tensor& param) {
+    if (param.dim() == 3 && param.size(0) == batch && param.size(1) != dim) {
+      auto groups = param.size(1);
+      TORCH_CHECK(dim % groups == 0,
+                  name, " group dimension must divide D.");
+      TORCH_CHECK(param.size(2) == state_dim,
+                  name, " must have matching state dimension.");
+      return param.repeat_interleave(dim / groups, 1);
+    }
+    return param;
+  };
 
-  if (D_compute.has_value()) {
-    output = output +
-             D_compute.value().view({1, dim}) * x_compute;
+  auto B_prepared = maybe_group("B", B);
+  auto C_prepared = maybe_group("C", C);
+
+  auto B_info = make_scan_param("B", B_prepared, batch, dim, state_dim, 1,
+                                compute_dtype, device);
+  auto C_info = make_scan_param("C", C_prepared, batch, dim, state_dim, 1,
+                                compute_dtype, device);
+
+  c10::optional<at::Tensor> D_compute = c10::nullopt;
+  if (D.has_value()) {
+    const auto& tensor = D.value();
+    TORCH_CHECK(tensor.dim() == 1 && tensor.size(0) == dim,
+                "D must have shape (D,).");
+    D_compute = to_compute(tensor, compute_dtype, device).contiguous();
   }
 
-  if (z_compute.has_value()) {
-    output = output * at::silu(z_compute.value());
+  c10::optional<at::Tensor> z_gate = c10::nullopt;
+  if (z.has_value()) {
+    const auto& tensor = z.value();
+    TORCH_CHECK(tensor.dim() == 2 && tensor.sizes() == x.sizes(),
+                "z must have shape (B, D).");
+    z_gate = at::silu(to_compute(tensor, compute_dtype, device)).contiguous();
   }
 
-  state.copy_(new_state.to(state.scalar_type()));
+  auto output =
+      at::empty({batch, dim}, x.options().dtype(compute_dtype)).contiguous();
+
+  AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES(
+      compute_dtype, "selective_state_step_cpu", [&]() {
+        const auto* x_ptr = x_compute.data_ptr<scalar_t>();
+        const auto* dt_ptr = dt_compute.data_ptr<scalar_t>();
+        const auto* A_ptr = A_compute.data_ptr<scalar_t>();
+        const auto* D_ptr =
+            D_compute.has_value() ? D_compute.value().data_ptr<scalar_t>()
+                                  : nullptr;
+        const auto* z_ptr =
+            z_gate.has_value() ? z_gate.value().data_ptr<scalar_t>() : nullptr;
+        auto* state_ptr = state_compute.data_ptr<scalar_t>();
+        auto* out_ptr = output.data_ptr<scalar_t>();
+
+        const auto row_stride = dim;
+        const auto state_stride = state_dim;
+
+        at::parallel_for(0, batch * dim, 0, [&](int64_t start, int64_t end) {
+          for (const auto idx : c10::irange(start, end)) {
+            const auto b = idx / dim;
+            const auto d_idx = idx % dim;
+            const auto offset = b * row_stride + d_idx;
+            const auto state_offset = idx * state_stride;
+
+            const auto dt_val = dt_ptr[offset];
+            const auto x_val = x_ptr[offset];
+
+            const auto* A_row = A_ptr + d_idx * state_stride;
+            auto* state_row = state_ptr + state_offset;
+
+            const auto B_slice =
+                scan_param_slice<scalar_t>(B_info, b, d_idx, 0);
+            const auto C_slice =
+                scan_param_slice<scalar_t>(C_info, b, d_idx, 0);
+            const auto* B_ptr = B_slice.ptr;
+            const auto* C_ptr = C_slice.ptr;
+            const auto B_stride = B_slice.stride;
+            const auto C_stride = C_slice.stride;
+
+            scalar_t y_val = scalar_t(0);
+
+            for (const auto n : c10::irange(state_dim)) {
+              const auto decay = std::exp(dt_val * A_row[n]);
+              const auto drive = B_ptr[n * B_stride] * x_val;
+              const auto updated = decay * state_row[n] + dt_val * drive;
+              state_row[n] = updated;
+              y_val += updated * C_ptr[n * C_stride];
+            }
+
+            if (D_ptr != nullptr) {
+              y_val += D_ptr[d_idx] * x_val;
+            }
+
+            if (z_ptr != nullptr) {
+              y_val *= z_ptr[offset];
+            }
+
+            out_ptr[offset] = y_val;
+          }
+        });
+      });
+
+  state.copy_(state_compute.to(state.scalar_type()));
   return output.to(x.scalar_type());
 }
 

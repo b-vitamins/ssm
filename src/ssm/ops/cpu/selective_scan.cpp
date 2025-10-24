@@ -1,52 +1,14 @@
 #include "common.h"
 
 #include <ATen/ATen.h>
+#include <ATen/Parallel.h>
 
+#include <cmath>
+#include <complex>
 #include <tuple>
-#include <vector>
 
 namespace ssm {
 namespace cpu {
-
-namespace {
-
-at::Tensor normalize_scan_param(const std::string& name, const at::Tensor& param,
-                                int64_t batch, int64_t dim, int64_t state_dim,
-                                int64_t length, at::ScalarType dtype,
-                                const at::Device& device) {
-  if (param.dim() == 2) {
-    if (param.size(0) != dim || param.size(1) != state_dim) {
-      TORCH_CHECK(false, name, " must have shape (D, N).");
-    }
-    return to_compute(param, dtype, device)
-        .view({1, dim, state_dim, 1})
-        .expand({batch, dim, state_dim, length});
-  }
-  if (param.dim() == 3) {
-    if (param.size(0) != batch || param.size(1) != dim ||
-        param.size(2) != state_dim) {
-      TORCH_CHECK(false, name,
-                  " must have shape (B, D, N) when 3-D.");
-    }
-    return to_compute(param, dtype, device)
-        .unsqueeze(-1)
-        .expand({batch, dim, state_dim, length});
-  }
-  if (param.dim() == 4) {
-    TORCH_CHECK(param.size(0) == batch && param.size(3) == length,
-                name, " must have shape (B, G, N, L) when 4-D.");
-    auto groups = param.size(1);
-    TORCH_CHECK(dim % groups == 0, "Group dimension must divide D.");
-    auto repeated = to_compute(param, dtype, device)
-                        .repeat_interleave(dim / groups, 1);
-    TORCH_CHECK(repeated.size(2) == state_dim, name,
-                " has mismatched state dimension.");
-    return repeated;
-  }
-  TORCH_CHECK(false, "Unsupported rank for ", name, ".");
-}
-
-}  // namespace
 
 std::tuple<at::Tensor, at::Tensor> selective_scan_cpu(
     const at::Tensor& u, const at::Tensor& delta, const at::Tensor& A,
@@ -74,30 +36,9 @@ std::tuple<at::Tensor, at::Tensor> selective_scan_cpu(
 
   const auto device = u.device();
 
-  auto u_compute = to_compute(u, compute_dtype, device);
+  auto u_compute = to_compute(u, compute_dtype, device).contiguous();
   auto delta_compute = to_compute(delta, compute_dtype, device);
-  auto A_compute = to_compute(A, compute_dtype, device);
-
-  auto B_full = normalize_scan_param("B", B, batch, dim, state_dim, length,
-                                     compute_dtype, device);
-  auto C_full = normalize_scan_param("C", C, batch, dim, state_dim, length,
-                                     compute_dtype, device);
-
-  c10::optional<at::Tensor> D_compute = c10::nullopt;
-  if (D.has_value()) {
-    const auto& tensor = D.value();
-    TORCH_CHECK(tensor.dim() == 1 && tensor.size(0) == dim,
-                "D must have shape (D,).");
-    D_compute = to_compute(tensor, compute_dtype, device);
-  }
-
-  c10::optional<at::Tensor> z_compute = c10::nullopt;
-  if (z.has_value()) {
-    const auto& tensor = z.value();
-    TORCH_CHECK(tensor.dim() == 3 && tensor.sizes() == u.sizes(),
-                "z must have shape (B, D, L).");
-    z_compute = to_compute(tensor, compute_dtype, device);
-  }
+  auto A_compute = to_compute(A, compute_dtype, device).contiguous();
 
   if (dt_bias.has_value()) {
     const auto& tensor = dt_bias.value();
@@ -112,41 +53,106 @@ std::tuple<at::Tensor, at::Tensor> selective_scan_cpu(
     delta_compute = at::softplus(delta_compute);
   }
 
-  auto state = at::zeros({batch, dim, state_dim},
-                         u.options().dtype(compute_dtype));
-  std::vector<at::Tensor> outputs;
-  outputs.reserve(length);
+  delta_compute = delta_compute.contiguous();
 
-  const auto A_expanded = A_compute.unsqueeze(0);  // (1, D, N)
+  auto B_info = make_scan_param("B", B, batch, dim, state_dim, length,
+                                compute_dtype, device);
+  auto C_info = make_scan_param("C", C, batch, dim, state_dim, length,
+                                compute_dtype, device);
 
-  for (int64_t t = 0; t < length; ++t) {
-    auto delta_t = delta_compute.select(-1, t);        // (B, D)
-    auto decay = (delta_t.unsqueeze(-1) * A_expanded).exp();
-    auto B_t = B_full.select(-1, t);                   // (B, D, N)
-    auto C_t = C_full.select(-1, t);                   // (B, D, N)
-    auto drive = B_t * u_compute.select(-1, t).unsqueeze(-1);
-    state = decay * state + delta_t.unsqueeze(-1) * drive;
-    auto y_t = (state * C_t).sum(-1);
-
-    if (D_compute.has_value()) {
-      y_t = y_t +
-            D_compute.value().view({1, dim}) * u_compute.select(-1, t);
-    }
-
-    if (z_compute.has_value()) {
-      y_t = y_t * at::silu(z_compute.value().select(-1, t));
-    }
-
-    outputs.push_back(y_t);
+  c10::optional<at::Tensor> D_compute = c10::nullopt;
+  if (D.has_value()) {
+    const auto& tensor = D.value();
+    TORCH_CHECK(tensor.dim() == 1 && tensor.size(0) == dim,
+                "D must have shape (D,).");
+    D_compute = to_compute(tensor, compute_dtype, device).contiguous();
   }
 
-  auto output = at::stack(outputs, -1).to(u.scalar_type());
-  auto last_state = state.to(u.scalar_type());
-
-  if (!return_last_state) {
-    return std::make_tuple(output, last_state);
+  c10::optional<at::Tensor> z_gate = c10::nullopt;
+  if (z.has_value()) {
+    const auto& tensor = z.value();
+    TORCH_CHECK(tensor.dim() == 3 && tensor.sizes() == u.sizes(),
+                "z must have shape (B, D, L).");
+    z_gate = at::silu(to_compute(tensor, compute_dtype, device)).contiguous();
   }
-  return std::make_tuple(output, last_state);
+
+  auto state =
+      at::zeros({batch, dim, state_dim}, u.options().dtype(compute_dtype))
+          .contiguous();
+  auto output =
+      at::empty({batch, dim, length}, u.options().dtype(compute_dtype));
+
+  AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES(
+      compute_dtype, "selective_scan_cpu", [&]() {
+        const auto* u_ptr = u_compute.data_ptr<scalar_t>();
+        const auto* delta_ptr = delta_compute.data_ptr<scalar_t>();
+        const auto* A_ptr = A_compute.data_ptr<scalar_t>();
+        const auto* D_ptr =
+            D_compute.has_value() ? D_compute.value().data_ptr<scalar_t>()
+                                  : nullptr;
+        const auto* z_ptr =
+            z_gate.has_value() ? z_gate.value().data_ptr<scalar_t>() : nullptr;
+        auto* state_ptr = state.data_ptr<scalar_t>();
+        auto* out_ptr = output.data_ptr<scalar_t>();
+
+        const auto row_stride = length;
+        const auto state_stride = state_dim;
+
+        at::parallel_for(0, batch * dim, 0, [&](int64_t start, int64_t end) {
+          for (const auto idx : c10::irange(start, end)) {
+            const auto b = idx / dim;
+            const auto d_idx = idx % dim;
+            const auto row_offset = idx * row_stride;
+            const auto state_offset = idx * state_stride;
+
+            const auto* A_row = A_ptr + d_idx * state_stride;
+            auto* state_row = state_ptr + state_offset;
+            auto* out_row = out_ptr + row_offset;
+
+            for (const auto t : c10::irange(length)) {
+              const auto delta_val = delta_ptr[row_offset + t];
+              const auto u_val = u_ptr[row_offset + t];
+
+              const auto B_slice =
+                  scan_param_slice<scalar_t>(B_info, b, d_idx, t);
+              const auto C_slice =
+                  scan_param_slice<scalar_t>(C_info, b, d_idx, t);
+
+              const auto* B_ptr = B_slice.ptr;
+              const auto* C_ptr = C_slice.ptr;
+              const auto B_stride = B_slice.stride;
+              const auto C_stride = C_slice.stride;
+
+              scalar_t y_val = scalar_t(0);
+
+              for (const auto n : c10::irange(state_dim)) {
+                const auto decay = std::exp(delta_val * A_row[n]);
+                const auto drive = B_ptr[n * B_stride] * u_val;
+                const auto updated = decay * state_row[n] + delta_val * drive;
+                state_row[n] = updated;
+                y_val += updated * C_ptr[n * C_stride];
+              }
+
+              if (D_ptr != nullptr) {
+                y_val += D_ptr[d_idx] * u_val;
+              }
+
+              if (z_ptr != nullptr) {
+                y_val *= z_ptr[row_offset + t];
+              }
+
+              out_row[t] = y_val;
+            }
+          }
+        });
+      });
+
+  auto output_cast = output.to(u.scalar_type());
+  at::Tensor last_state;
+  if (return_last_state) {
+    last_state = state.to(u.scalar_type());
+  }
+  return std::make_tuple(output_cast, last_state);
 }
 
 }  // namespace cpu
