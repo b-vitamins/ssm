@@ -226,11 +226,14 @@ class MambaLMHeadModel(nn.Module):
 ```
 
 ``from_pretrained`` and ``save_pretrained`` use :mod:`ssm.utils.weights` helpers to
-interoperate with Hugging Face local directories or Hub checkpoints. Generation
-supports greedy sampling, top-k/top-p/min-p sampling, repetition penalties,
-teacher forcing, optional CUDA graph capture, and prompt/token streaming. It
-returns a tensor by default or ``GenerationOutput`` when
-``return_dict_in_generate`` is ``True``.
+interoperate with Hugging Face local directories or Hub checkpoints. Remote
+artifacts are streamed via :func:`huggingface_hub.cached_file`, falling back to
+local paths when present. Providing a ``dtype`` causes the loader to materialize
+weights on CPU before casting and transferring to the requested device to keep
+peak memory usage predictable. Generation supports greedy sampling, top-k/top-p
+/min-p sampling, repetition penalties, teacher forcing, optional CUDA graph
+capture, and prompt/token streaming. It returns a tensor by default or
+``GenerationOutput`` when ``return_dict_in_generate`` is ``True``.
 
 ## Ops (Python signatures)
 
