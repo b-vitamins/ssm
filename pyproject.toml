@@ -16,6 +16,7 @@ dependencies = [
   "torch",
   "einops",
   "numpy",
+  "huggingface-hub",
 ]
 
 [project.optional-dependencies]
@@ -35,3 +36,6 @@ addopts = "-ra -q"
 testpaths = [
   "tests",
 ]
+
+[tool.ruff]
+exclude = ["reference_mamba"]
