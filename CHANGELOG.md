@@ -15,6 +15,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Simplified `scripts/regenerate_goldens.py` to rely on the editable install instead of mutating `sys.path`.
 - Added NumPy as a core dependency so Torch can initialize its NumPy bridge without warnings.
 - Standardized the CI pipeline on Python 3.11 to reduce redundant matrix executions.
+### Fixed
+- Corrected top-p nucleus sampling to retain the threshold token and added a regression test guarding against regressions.
 
 ## [0.1.0.dev0] - 2025-10-24
 ### Added
