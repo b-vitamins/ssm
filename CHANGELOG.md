@@ -6,6 +6,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 ### Added
+- Autograd-enabled CUDA dispatch for selective scan, state step, SSD chunk scan,
+  depthwise causal convolution, and fused layer norm with reference-validated
+  gradients and expanded GPU tests.
 - Hugging Face Hub checkpoint resolution backed by ``cached_file`` with dtype
   remapping support, updated language model helpers, docs, and unit tests.
 - Expanded generation helpers with reusable inference parameter management,

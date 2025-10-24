@@ -29,6 +29,8 @@ This roadmap outlines milestones for implementing SSM Core on top of the scaffol
 - Implement pure CUDA kernels for core ops; add CUTLASS optionally for dense segments.
 - Ensure CUDA graph capture and amp compatibility.
 - Varlen support and step-update paths.
+- Integrate autograd wrappers that validate fused CUDA kernels against the Python
+  reference implementations with gradient tests.
 
 ## Phase 4 — Optimization & Stability
 - Precision refinements (master fp32 where needed).
