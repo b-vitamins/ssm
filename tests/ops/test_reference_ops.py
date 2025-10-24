@@ -88,6 +88,22 @@ def test_selective_state_step_updates_state_and_grad():
     assert x.grad is not None
 
 
+def test_selective_state_step_accepts_grouped_projections():
+    torch.manual_seed(20)
+    B, D, N, groups = 2, 4, 3, 2
+    state = torch.zeros(B, D, N, dtype=torch.float32)
+    x = torch.randn(B, D, dtype=torch.float32)
+    dt = torch.randn(B, D, dtype=torch.float32)
+    A = torch.randn(D, N, dtype=torch.float32)
+    B_grouped = torch.randn(B, groups, N, dtype=torch.float32)
+    C_grouped = torch.randn(B, groups, N, dtype=torch.float32)
+
+    out = selective_state_step(state, x, dt, A, B_grouped, C_grouped)
+
+    assert out.shape == (B, D)
+    assert state.abs().sum() > 0
+
+
 def test_ssd_chunk_scan_matches_across_chunk_sizes(ragged_seq_meta):
     torch.manual_seed(3)
     B, L, H, P = 2, 5, 2, 3
