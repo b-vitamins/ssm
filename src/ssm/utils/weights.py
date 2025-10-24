@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping, cast
 
 import torch
 
@@ -73,7 +73,9 @@ def _resolve_checkpoint_file(
             "huggingface_hub is required to download remote checkpoints"
         ) from exc
 
-    resolved_file = cached_file(
+    cached_file_fn = cast(Callable[..., str | None], cached_file)
+
+    resolved_file = cached_file_fn(
         str(model_name),
         filename,
         revision=revision,
