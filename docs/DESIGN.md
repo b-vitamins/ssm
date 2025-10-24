@@ -15,7 +15,10 @@ This document describes the architecture and rationale behind the SSM Core proje
 ### Layers and Composition
 
 - Modules (Mamba1, Mamba2, MHA, MLP) implement model logic using ops.
-- `Block` handles residual policy + fused normalization.
+- `Block` handles residual policy + fused normalization, falling back to PyTorch when Triton kernels are absent.
+- `MHA` mirrors the upstream Mamba reference with grouped KV heads, optional depthwise conv warmup, rotary embeddings,
+  and a fused gated-MLP projection path.
+- `GatedMLP` provides the SwiGLU-style feed-forward used by both the attention module and SSM blocks.
 - `MambaLMHeadModel` builds an LM backbone and exposes generation.
 
 ### Ops and Backends

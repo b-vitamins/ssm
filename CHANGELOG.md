@@ -6,6 +6,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 ### Added
+- Implemented the hybrid block, multi-head attention (with cache/conv support), and gated MLP modules with docs and unit tests.
 - Initial scaffold with docs (API, DESIGN, ROADMAP), package layout under `src/ssm/`, and comprehensive test suite (contracts + goldens harness).
 - Contributor guide (AGENTS.md) with Conventional Commits and CHANGELOG policy.
 - Minimal GRU-backed `MambaLMHeadModel` forward pass wired for cache-aware decoding.
