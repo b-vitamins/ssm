@@ -10,7 +10,23 @@ from ssm import ops
 
 
 class Mamba2(nn.Module):
-    """State Space Dual (Mamba v2) block implemented with reference ops."""
+    """State Space Dual (Mamba v2) block implemented with reference ops.
+
+    Args:
+        d_model: Model embedding dimension.
+        d_state: State size used by the selective scan dynamics.
+        d_conv: Depthwise convolution kernel width.
+        headdim: Channel dimension per attention-style head.
+        expand: Multiplicative expansion factor for the intermediate channel count.
+        ngroups: Number of groups for grouped convolutions (reserved for fused kernels).
+        d_ssm: Number of channels routed through the SSM branch.
+        chunk_size: Scan chunk size used by the reference ops implementation.
+        bias: Whether to include bias terms on the linear projections.
+        conv_bias: Whether to include bias terms on the convolution path.
+        layer_idx: Layer index metadata for potential parameter sharing.
+        device: Optional device for parameter initialization.
+        dtype: Optional dtype for parameter initialization.
+    """
 
     def __init__(
         self,

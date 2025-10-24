@@ -9,7 +9,23 @@ from ssm import ops
 
 
 class Mamba1(nn.Module):
-    """Selective SSM (Mamba v1) block backed by the reference ops."""
+    """Selective SSM (Mamba v1) block backed by the reference ops.
+
+    Args:
+        d_model: Model embedding dimension.
+        d_state: State size used by the selective scan dynamics.
+        d_conv: Depthwise convolution kernel width.
+        expand: Multiplicative expansion factor for the intermediate channel count.
+        dt_min: Lower bound for the time-step initialization (kept for API parity).
+        dt_max: Upper bound for the time-step initialization (kept for API parity).
+        dt_init_floor: Floor value for the time-step initialization (kept for API parity).
+        bias: Whether to include bias terms on the linear projections.
+        conv_bias: Whether to include bias terms on the convolution path.
+        use_fast_path: Unused flag reserved for fused-kernel integration.
+        layer_idx: Layer index metadata for potential parameter sharing.
+        device: Optional device for parameter initialization.
+        dtype: Optional dtype for parameter initialization.
+    """
 
     def __init__(
         self,
