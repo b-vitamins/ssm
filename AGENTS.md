@@ -11,10 +11,11 @@
 - Scripts: `scripts/` (e.g., `regenerate_goldens.py`)
 
 ## Build, Test, and Development Commands
-- Install (editable): `python -m pip install -e .`
+- Install dependencies immediately after starting a new container or shell session: `python -m pip install -e .[dev]`
 - Run tests: `pytest -q`
 - Run golden tests: `pytest -q --run-goldens`
 - Regenerate placeholder goldens: `python scripts/regenerate_goldens.py`
+- Before sending a PR, run the full quality gate locally: `ruff check .`, `pyright`, and `pytest -q`
 
 ### Guix Environment (optional)
 - Enter dev shell: `guix shell -m manifest.scm --`

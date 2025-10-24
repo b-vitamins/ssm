@@ -13,7 +13,9 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
-    config.addinivalue_line("markers", "golden: marks tests as golden (skip by default)")
+    config.addinivalue_line(
+        "markers", "golden: marks tests as golden (skip by default)"
+    )
     # Ensure src/ is importable without installing the package
     root = Path(__file__).resolve().parents[1]
     src = root / "src"

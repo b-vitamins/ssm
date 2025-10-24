@@ -53,4 +53,6 @@ class GatedMLP(nn.Module):
         Raises:
             NotImplementedError: Implementation to be provided later.
         """
-        raise NotImplementedError("GatedMLP.forward is not implemented in the scaffold.")
+        raise NotImplementedError(
+            "GatedMLP.forward is not implemented in the scaffold."
+        )
