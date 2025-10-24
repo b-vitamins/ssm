@@ -23,14 +23,26 @@ class MambaLMHeadModel(nn.Module):
         dtype: Optional dtype for parameters.
     """
 
-    def __init__(self, config: MambaConfig, initializer_cfg: dict | None = None, device=None, dtype=None) -> None:
+    def __init__(
+        self,
+        config: MambaConfig,
+        initializer_cfg: dict | None = None,
+        device=None,
+        dtype=None,
+    ) -> None:
         super().__init__()
         self.config = config
         self.initializer_cfg = initializer_cfg or {}
         self.device = device
         self.dtype = dtype
 
-    def allocate_inference_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype | None = None, **kwargs):
+    def allocate_inference_cache(
+        self,
+        batch_size: int,
+        max_seqlen: int,
+        dtype: torch.dtype | None = None,
+        **kwargs,
+    ):
         """Allocate decoding cache for the backbone.
 
         Args:
@@ -45,7 +57,9 @@ class MambaLMHeadModel(nn.Module):
         Raises:
             NotImplementedError: Implementation to be supplied later.
         """
-        raise NotImplementedError("MambaLMHeadModel.allocate_inference_cache is not implemented in the scaffold.")
+        raise NotImplementedError(
+            "MambaLMHeadModel.allocate_inference_cache is not implemented in the scaffold."
+        )
 
     def forward(
         self,
@@ -70,10 +84,14 @@ class MambaLMHeadModel(nn.Module):
         Raises:
             NotImplementedError: Implementation to be supplied later.
         """
-        raise NotImplementedError("MambaLMHeadModel.forward is not implemented in the scaffold.")
+        raise NotImplementedError(
+            "MambaLMHeadModel.forward is not implemented in the scaffold."
+        )
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name: str, device=None, dtype=None, **kwargs) -> "MambaLMHeadModel":
+    def from_pretrained(
+        cls, pretrained_model_name: str, device=None, dtype=None, **kwargs
+    ) -> "MambaLMHeadModel":
         """Construct from a pre-trained checkpoint.
 
         Args:
@@ -88,7 +106,9 @@ class MambaLMHeadModel(nn.Module):
         Raises:
             NotImplementedError: Implementation to be supplied later.
         """
-        raise NotImplementedError("MambaLMHeadModel.from_pretrained is not implemented in the scaffold.")
+        raise NotImplementedError(
+            "MambaLMHeadModel.from_pretrained is not implemented in the scaffold."
+        )
 
     def save_pretrained(self, save_directory: str) -> None:
         """Save model weights and config to a directory.
@@ -99,7 +119,9 @@ class MambaLMHeadModel(nn.Module):
         Raises:
             NotImplementedError: Implementation to be supplied later.
         """
-        raise NotImplementedError("MambaLMHeadModel.save_pretrained is not implemented in the scaffold.")
+        raise NotImplementedError(
+            "MambaLMHeadModel.save_pretrained is not implemented in the scaffold."
+        )
 
     def generate(
         self,
@@ -132,4 +154,6 @@ class MambaLMHeadModel(nn.Module):
         Raises:
             NotImplementedError: Implementation to be supplied later.
         """
-        raise NotImplementedError("MambaLMHeadModel.generate is not implemented in the scaffold.")
+        raise NotImplementedError(
+            "MambaLMHeadModel.generate is not implemented in the scaffold."
+        )

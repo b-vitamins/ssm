@@ -41,7 +41,13 @@ class Block(nn.Module):
         self.fused_add_norm = fused_add_norm
         self.residual_in_fp32 = residual_in_fp32
 
-    def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor | None = None, inference_params=None, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        inference_params=None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply fused add+norm, mixer, and optional MLP.
 
         Args:

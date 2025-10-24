@@ -81,7 +81,9 @@ class MHA(nn.Module):
         """
         raise NotImplementedError("MHA.forward is not implemented in the scaffold.")
 
-    def allocate_inference_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype | None = None):
+    def allocate_inference_cache(
+        self, batch_size: int, max_seqlen: int, dtype: torch.dtype | None = None
+    ):
         """Allocate KV cache for decoding.
 
         Args:
@@ -95,4 +97,6 @@ class MHA(nn.Module):
         Raises:
             NotImplementedError: Implementation to be provided later.
         """
-        raise NotImplementedError("MHA.allocate_inference_cache is not implemented in the scaffold.")
+        raise NotImplementedError(
+            "MHA.allocate_inference_cache is not implemented in the scaffold."
+        )

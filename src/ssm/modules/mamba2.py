@@ -91,7 +91,13 @@ class Mamba2(nn.Module):
         """
         raise NotImplementedError("Mamba2.forward is not implemented in the scaffold.")
 
-    def allocate_inference_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype | None = None, **kwargs):
+    def allocate_inference_cache(
+        self,
+        batch_size: int,
+        max_seqlen: int,
+        dtype: torch.dtype | None = None,
+        **kwargs,
+    ):
         """Allocate decoding cache tensors for step-wise inference.
 
         Args:
@@ -107,4 +113,6 @@ class Mamba2(nn.Module):
             This stub defines the expected contract but does not allocate tensors.
             Implementations must return real structures matching the documented shapes.
         """
-        raise NotImplementedError("Mamba2.allocate_inference_cache is not implemented in the scaffold.")
+        raise NotImplementedError(
+            "Mamba2.allocate_inference_cache is not implemented in the scaffold."
+        )

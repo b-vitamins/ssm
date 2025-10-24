@@ -62,7 +62,9 @@ class Mamba1(nn.Module):
         # specific implementation. Implementations will define and register
         # parameters when added.
 
-    def forward(self, hidden_states: torch.Tensor, inference_params=None, **kwargs) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, inference_params=None, **kwargs
+    ) -> torch.Tensor:
         """Apply the Mamba1 block.
 
         Args:
@@ -79,7 +81,13 @@ class Mamba1(nn.Module):
         """
         raise NotImplementedError("Mamba1.forward is not implemented in the scaffold.")
 
-    def allocate_inference_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype | None = None, **kwargs):
+    def allocate_inference_cache(
+        self,
+        batch_size: int,
+        max_seqlen: int,
+        dtype: torch.dtype | None = None,
+        **kwargs,
+    ):
         """Allocate decoding cache tensors for step-wise inference.
 
         Args:
@@ -97,4 +105,6 @@ class Mamba1(nn.Module):
             This stub defines the expected shapes but does not allocate tensors.
             Implementations must return real tensors matching the above shapes.
         """
-        raise NotImplementedError("Mamba1.allocate_inference_cache is not implemented in the scaffold.")
+        raise NotImplementedError(
+            "Mamba1.allocate_inference_cache is not implemented in the scaffold."
+        )

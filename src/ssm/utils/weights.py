@@ -13,7 +13,9 @@ def load_config_hf(model_name: str) -> dict:
     Raises:
         NotImplementedError: Implementation to be supplied later.
     """
-    raise NotImplementedError("utils.load_config_hf is not implemented in the scaffold.")
+    raise NotImplementedError(
+        "utils.load_config_hf is not implemented in the scaffold."
+    )
 
 
 def load_state_dict_hf(model_name: str, device=None, dtype=None) -> dict:
@@ -30,4 +32,6 @@ def load_state_dict_hf(model_name: str, device=None, dtype=None) -> dict:
     Raises:
         NotImplementedError: Implementation to be supplied later.
     """
-    raise NotImplementedError("utils.load_state_dict_hf is not implemented in the scaffold.")
+    raise NotImplementedError(
+        "utils.load_state_dict_hf is not implemented in the scaffold."
+    )
