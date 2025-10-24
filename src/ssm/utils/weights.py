@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import json
 from pathlib import Path
 from typing import Mapping
@@ -11,28 +10,67 @@ CONFIG_FILE = "config.json"
 WEIGHTS_FILE = "pytorch_model.bin"
 
 
-def _resolve_directory(model_name: str | Path) -> Path:
-    """Resolve ``model_name`` to a local directory path.
+def _resolve_directory(
+    model_name: str | Path,
+    *,
+    revision: str | None = None,
+    token: str | None = None,
+    cache_dir: str | Path | None = None,
+    local_files_only: bool = False,
+) -> Path:
+    """Resolve ``model_name`` to a checkpoint directory.
 
-    Remote (Hub) resolution is intentionally not implemented in the scaffold to
-    keep the dependency surface minimal. The helper nonetheless performs basic
-    validation so callers receive actionable errors.
+    Local paths are returned directly. Remote Hugging Face Hub identifiers are
+    downloaded with :func:`huggingface_hub.snapshot_download` when available.
     """
 
     model_path = Path(model_name)
-    if not model_path.exists():
-        raise FileNotFoundError(f"model directory not found: {model_path}")
-    if not model_path.is_dir():
-        raise ValueError(f"expected a directory path, received: {model_path}")
-    return model_path
+    is_path_like = not isinstance(model_name, str)
+    if is_path_like or model_path.is_absolute():
+        if not model_path.exists():
+            raise FileNotFoundError(f"model directory not found: {model_path}")
+        if not model_path.is_dir():
+            raise ValueError(f"expected a directory path, received: {model_path}")
+        return model_path
+    if model_path.exists():
+        if not model_path.is_dir():
+            raise ValueError(f"expected a directory path, received: {model_path}")
+        return model_path
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "huggingface_hub is required to download remote checkpoints"
+        ) from exc
+
+    download_path = snapshot_download(
+        repo_id=str(model_name),
+        revision=revision,
+        token=token,
+        cache_dir=str(cache_dir) if cache_dir is not None else None,
+        local_files_only=local_files_only,
+    )
+    return Path(download_path)
 
 
-def load_config_hf(model_name: str | Path) -> dict:
-    """Load a configuration dictionary from a local directory.
+def load_config_hf(
+    model_name: str | Path,
+    *,
+    revision: str | None = None,
+    token: str | None = None,
+    cache_dir: str | Path | None = None,
+    local_files_only: bool = False,
+) -> dict:
+    """Load a configuration dictionary from a checkpoint directory.
 
     Args:
-        model_name: Hugging Face repo id or local directory. Only local
-            directories are supported in the scaffold.
+        model_name: Hugging Face repo id or local directory.
+        revision: Optional Git revision to download from the Hub.
+        token: Optional authentication token passed to the Hub client.
+        cache_dir: Optional cache directory override for Hub downloads.
+        local_files_only: If ``True``, only use local cache entries without
+            attempting to reach the network.
 
     Returns:
         The parsed configuration dictionary.
@@ -42,7 +80,13 @@ def load_config_hf(model_name: str | Path) -> dict:
         ValueError: If the configuration file cannot be parsed.
     """
 
-    directory = _resolve_directory(model_name)
+    directory = _resolve_directory(
+        model_name,
+        revision=revision,
+        token=token,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+    )
     config_path = directory / CONFIG_FILE
     if not config_path.exists():
         raise FileNotFoundError(f"configuration file not found: {config_path}")
@@ -58,14 +102,23 @@ def load_state_dict_hf(
     model_name: str | Path,
     device=None,
     dtype: torch.dtype | None = None,
+    *,
+    revision: str | None = None,
+    token: str | None = None,
+    cache_dir: str | Path | None = None,
+    local_files_only: bool = False,
 ) -> dict[str, torch.Tensor]:
-    """Load a PyTorch state dict from a local directory.
+    """Load a PyTorch state dict from a checkpoint directory.
 
     Args:
-        model_name: Hugging Face repo id or local directory. Only local
-            directories are supported in the scaffold.
+        model_name: Hugging Face repo id or local directory.
         device: Optional device mapping passed to :func:`torch.load`.
         dtype: Optional dtype cast applied to each tensor.
+        revision: Optional Git revision to download from the Hub.
+        token: Optional authentication token passed to the Hub client.
+        cache_dir: Optional cache directory override for Hub downloads.
+        local_files_only: If ``True``, only use local cache entries without
+            attempting to reach the network.
 
     Returns:
         Mapping from parameter names to tensors.
@@ -74,7 +127,13 @@ def load_state_dict_hf(
         FileNotFoundError: If the directory or weights file is missing.
     """
 
-    directory = _resolve_directory(model_name)
+    directory = _resolve_directory(
+        model_name,
+        revision=revision,
+        token=token,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+    )
     weights_path = directory / WEIGHTS_FILE
     if not weights_path.exists():
         raise FileNotFoundError(f"weights file not found: {weights_path}")

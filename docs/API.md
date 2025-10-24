@@ -12,7 +12,7 @@ This document defines the public API for the SSM Core project. All modules and o
     - `block.py` – Fused add+norm wrapper with residual policy
     - `mlp.py` – Gated MLP
   - `models/`
-    - `lm.py` – Causal LM wrapper (backbone + lm_head + generation mixin)
+    - `lm.py` – Mixer backbone, inference cache helpers, and causal LM wrapper
     - `config.py` – Dataclasses configuration for models
   - `ops/`
     - `python/reference.py` – Reference (pure PyTorch) op signatures
@@ -158,16 +158,67 @@ class MambaConfig:
     tie_embeddings: bool = True
 ```
 
+### ssm.models.lm.MixerInferenceParams
+```python
+@dataclass
+class MixerInferenceParams:
+    max_seqlen: int
+    layer_states: dict[int, Any] = field(default_factory=dict)
+    key_value_memory_dict: dict[int, Any] = field(default_factory=dict)
+    batch_size_offset: int = 0
+    seqlen_offset: int = 0
+```
+
+Container that mirrors the reference inference cache contract used by the upstream
+Mamba implementation. Per-layer SSM caches live in ``layer_states`` while attention
+layers populate ``key_value_memory_dict`` with KV tensors and optional convolution
+state.
+
+### ssm.models.lm.MixerModel
+```python
+class MixerModel(nn.Module):
+    def __init__(self, *, d_model: int, n_layer: int, d_intermediate: int, vocab_size: int,
+                 ssm_cfg: dict[str, Any] | None = None, attn_layer_idx: list[int] | None = None,
+                 attn_cfg: dict[str, Any] | None = None, norm_epsilon: float = 1e-5,
+                 rms_norm: bool = False, initializer_cfg: dict[str, Any] | None = None,
+                 fused_add_norm: bool = False, residual_in_fp32: bool = False,
+                 device=None, dtype=None) -> None: ...
+    def allocate_inference_cache(self, batch_size: int, max_seqlen: int,
+                                 dtype: torch.dtype | None = None, **kwargs) -> MixerInferenceParams: ...
+    def forward(self, input_ids: torch.Tensor, *,
+                inference_params: MixerInferenceParams | None = None, **mixer_kwargs) -> torch.Tensor: ...
+```
+
+Mixer backbone mirroring the reference ``mamba_ssm`` layout. It embeds tokens,
+applies ``Block`` modules (each wrapping either an SSM or attention mixer plus an
+optional gated MLP), and finishes with a norm. ``allocate_inference_cache`` returns
+``MixerInferenceParams`` populated with per-layer caches so incremental generation
+can reuse state.
+
 ### ssm.models.lm.MambaLMHeadModel
 ```python
 class MambaLMHeadModel(nn.Module):
     def __init__(self, config: MambaConfig, initializer_cfg: dict | None = None, device=None, dtype=None) -> None: ...
-    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor | None = None, inference_params=None, num_last_tokens: int = 0, **mixer_kwargs): ...
-    def generate(self, input_ids: torch.Tensor, max_length: int, top_k: int = 1, top_p: float = 0.0, min_p: float = 0.0, temperature: float = 1.0, return_dict_in_generate: bool = False, output_scores: bool = False, **kwargs): ...
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor | None = None,
+                inference_params: MixerInferenceParams | None = None, num_last_tokens: int = 0,
+                **mixer_kwargs) -> CausalLMOutput: ...
+    def allocate_inference_cache(self, batch_size: int, max_seqlen: int,
+                                 dtype: torch.dtype | None = None, **kwargs) -> MixerInferenceParams: ...
+    def generate(self, input_ids: torch.Tensor, max_length: int, top_k: int = 1, top_p: float = 0.0,
+                 min_p: float = 0.0, temperature: float = 1.0, return_dict_in_generate: bool = False,
+                 output_scores: bool = False, **kwargs): ...
     @classmethod
-    def from_pretrained(cls, pretrained_model_name: str, device=None, dtype=None, **kwargs) -> "MambaLMHeadModel": ...
-    def save_pretrained(self, save_directory: str) -> None: ...
+    def from_pretrained(cls, pretrained_model_name: str | os.PathLike[str], *, device=None, dtype=None,
+                        revision: str | None = None, token: str | None = None,
+                        cache_dir: str | os.PathLike[str] | None = None,
+                        local_files_only: bool = False, strict: bool = True) -> "MambaLMHeadModel": ...
+    def save_pretrained(self, save_directory: str | os.PathLike[str]) -> None: ...
 ```
+
+``from_pretrained`` and ``save_pretrained`` use :mod:`ssm.utils.weights` helpers to
+interoperate with Hugging Face local directories or Hub checkpoints. Generation
+returns a tensor by default or ``GenerationOutput`` when ``return_dict_in_generate``
+is ``True``.
 
 ## Ops (Python signatures)
 

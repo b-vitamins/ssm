@@ -6,6 +6,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 ### Added
+- Mixer-style language model backbone with optional attention, Hugging Face
+  save/load helpers, updated docs, and expanded generation tests.
 - Implemented the hybrid block, multi-head attention (with cache/conv support), and gated MLP modules with docs and unit tests.
 - Initial scaffold with docs (API, DESIGN, ROADMAP), package layout under `src/ssm/`, and comprehensive test suite (contracts + goldens harness).
 - Contributor guide (AGENTS.md) with Conventional Commits and CHANGELOG policy.
