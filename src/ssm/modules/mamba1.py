@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -100,6 +100,8 @@ class Mamba1(nn.Module):
             raise ValueError("hidden_states must have shape (B, L, d_model).")
 
         projected, gate = self.in_proj(hidden_states).chunk(2, dim=-1)
+        projected = cast(torch.Tensor, projected)
+        gate = cast(torch.Tensor, gate)
 
         conv_input = projected.permute(0, 2, 1)
         conv_out = ops.dw_causal_conv(
@@ -114,16 +116,19 @@ class Mamba1(nn.Module):
         z = gate.permute(0, 2, 1)
 
         A = -torch.exp(self.A_log)
-        output = ops.selective_scan(
-            u=u,
-            delta=delta,
-            A=A,
-            B=self.B,
-            C=self.C,
-            D=self.D,
-            z=z,
-            dt_bias=self.dt_bias,
-            softplus=True,
+        output = cast(
+            torch.Tensor,
+            ops.selective_scan(
+                u=u,
+                delta=delta,
+                A=A,
+                B=self.B,
+                C=self.C,
+                D=self.D,
+                z=z,
+                dt_bias=self.dt_bias,
+                softplus=True,
+            ),
         )
 
         output = output.permute(0, 2, 1)
