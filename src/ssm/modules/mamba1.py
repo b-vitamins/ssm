@@ -27,6 +27,23 @@ class Mamba1(nn.Module):
         device=None,
         dtype=None,
     ) -> None:
+        """Initialize the reference Mamba1 block.
+
+        Args:
+            d_model: Model embedding dimension.
+            d_state: State size used by the selective scan dynamics.
+            d_conv: Depthwise convolution kernel width.
+            expand: Multiplicative expansion factor for the intermediate channel count.
+            dt_min: Lower bound for the time-step initialization (kept for API parity).
+            dt_max: Upper bound for the time-step initialization (kept for API parity).
+            dt_init_floor: Floor value for the time-step initialization (kept for API parity).
+            bias: Whether to include bias terms on the linear projections.
+            conv_bias: Whether to include bias terms on the convolution path.
+            use_fast_path: Unused flag reserved for fused-kernel integration.
+            layer_idx: Layer index metadata for potential parameter sharing.
+            device: Optional device for parameter initialization.
+            dtype: Optional dtype for parameter initialization.
+        """
         super().__init__()
         del dt_min, dt_max, dt_init_floor  # Documented for parity with fused kernels.
 
@@ -68,7 +85,7 @@ class Mamba1(nn.Module):
         """Compute the reference Mamba1 forward pass.
 
         Args:
-            hidden_states (torch.Tensor): Input tensor shaped ``(batch, seqlen, d_model)``.
+            hidden_states: torch.Tensor shaped ``(batch, seqlen, d_model)``.
             inference_params: Optional inference helper parameters (unused for the reference path).
             **kwargs: Additional keyword arguments kept for API compatibility.
 
@@ -122,9 +139,9 @@ class Mamba1(nn.Module):
         """Allocate decoding cache tensors for streaming inference.
 
         Args:
-            batch_size (int): Maximum batch size expected during decode.
-            max_seqlen (int): Upper bound on the decoded sequence length. Unused by the reference path.
-            dtype (torch.dtype | None): Optional dtype override for the cache tensors.
+            batch_size: Maximum batch size expected during decode.
+            max_seqlen: Upper bound on the decoded sequence length. Unused by the reference path.
+            dtype: Optional dtype override for the cache tensors.
             **kwargs: Additional keyword arguments accepted for API parity.
 
         Returns:
