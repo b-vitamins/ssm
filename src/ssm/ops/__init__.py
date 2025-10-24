@@ -1010,7 +1010,18 @@ class _SSDChunkScanCudaFunction(torch.autograd.Function):
         for idx, grad in zip(mapping, grads):
             result[idx] = grad
 
-        return (*result, None)
+        return (
+            result[0],
+            result[1],
+            result[2],
+            result[3],
+            result[4],
+            None,  # chunk_size
+            result[5],
+            result[6],
+            None,  # seq_meta
+            result[7],
+        )
 
 
 class _DwCausalConvFunction(torch.autograd.Function):
