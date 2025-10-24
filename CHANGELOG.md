@@ -31,6 +31,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Standardized the CI pipeline on Python 3.11 to reduce redundant matrix executions.
 - Strengthened AGENTS.md instructions to enforce proactive CHANGELOG updates ahead of every PR.
 - Audited the Mamba reference blocks to perform fp32 accumulations with fewer layout conversions and documented the layout policy in `docs/DESIGN.md`.
+- Reimplemented the CPU selective scan, state step, SSD chunk scan, depthwise causal convolution, and fused layer norm kernels
+  with fused inner loops, grouped/time-varying parameter support, and explicit autograd regression coverage.
+- Refreshed `scripts/bench_cpu.py` and golden fixtures to exercise ragged and grouped workloads while reporting CPU speedups over the reference path.
 ### Fixed
 - Corrected top-p nucleus sampling to retain the threshold token and added a regression test guarding against regressions.
 - Tightened the decode streamer typing to satisfy static analysis and prevent CI regressions.
