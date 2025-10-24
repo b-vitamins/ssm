@@ -64,11 +64,6 @@ def _resolve_checkpoint_file(
 
     cache_dir_str = str(cache_dir) if cache_dir is not None else None
 
-    if local_files_only:
-        raise FileNotFoundError(
-            f"checkpoint file not found locally for '{model_name}': {filename}"
-        )
-
     try:
         from huggingface_hub import (  # pyright: ignore[reportMissingImports]
             cached_file,
