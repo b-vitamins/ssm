@@ -15,7 +15,8 @@
 - Run tests: `pytest -q`
 - Run golden tests: `pytest -q --run-goldens`
 - Regenerate placeholder goldens: `python scripts/regenerate_goldens.py`
-- Before sending a PR, run the full quality gate locally: `ruff check .`, `pyright`, and `pytest -q`
+- Before sending a PR, you **must** run the full quality gate locally—no exceptions.
+  Run `ruff check .`, `pyright`, and `pytest -q` before opening or updating any pull request, and include the command outputs in the PR discussion as evidence.
 
 ### Guix Environment (optional)
 - Enter dev shell: `guix shell -m manifest.scm --`
