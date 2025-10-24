@@ -1,10 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
 import time
+from dataclasses import dataclass
+from typing import Protocol
 
 import torch
+
+
+class GenerationStreamer(Protocol):
+    """Protocol describing the minimal streamer interface used by ``decode``."""
+
+    def put(self, token: torch.Tensor) -> None:
+        """Receive a newly generated token batch."""
+
+    def end(self) -> None:
+        """Signal that generation has finished."""
 
 
 @dataclass
@@ -37,7 +47,7 @@ def decode(
     cg: bool = False,
     enable_timing: bool = False,
     output_scores: bool = False,
-    streamer: Optional[object] = None,
+    streamer: GenerationStreamer | None = None,
 ):
     """Run an autoregressive decoding loop using the provided ``model``.
 
@@ -63,8 +73,8 @@ def decode(
             the CPU/reference path but the flag is accepted for API parity.
         enable_timing: If ``True`` collect simple timing metrics.
         output_scores: If ``True`` collect the per-step logits snapshots.
-        streamer: Optional streaming callback with a ``put`` method accepting
-            decoded token tensors and an optional ``end`` method.
+        streamer: Optional streaming callback implementing
+            :class:`GenerationStreamer`.
 
     Returns:
         DecodeOutput: Structure containing ``sequences`` and optional ``scores``
@@ -86,7 +96,7 @@ def decode(
         truncated = input_ids[:, :max_length].clone()
         scores: list[torch.Tensor] | None = [] if output_scores else None
         timings = {"prefill": 0.0, "decode": 0.0} if enable_timing else None
-        if streamer is not None and hasattr(streamer, "end"):
+        if streamer is not None:
             streamer.end()
         return DecodeOutput(sequences=truncated, scores=scores, timings=timings)
 
@@ -164,11 +174,11 @@ def decode(
                 if eos_token_id is not None:
                     finished = finished | (next_tokens == eos_token_id)
                     if finished.all():
-                        if streamer is not None and hasattr(streamer, "put"):
+                        if streamer is not None:
                             streamer.put(next_tokens)
                         break
 
-                if streamer is not None and hasattr(streamer, "put"):
+                if streamer is not None:
                     streamer.put(next_tokens)
 
                 outputs = model(
@@ -183,7 +193,7 @@ def decode(
     finally:
         if was_training:
             model.train()
-        if streamer is not None and hasattr(streamer, "end"):
+        if streamer is not None:
             streamer.end()
 
     return DecodeOutput(sequences=sequences, scores=scores, timings=timings)

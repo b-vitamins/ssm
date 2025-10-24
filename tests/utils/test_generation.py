@@ -62,6 +62,7 @@ def test_decode_teacher_forcing_with_streamer():
     assert model.training is True  # training mode restored
     assert output.sequences.shape == (1, 5)
     assert torch.equal(output.sequences[0, -3:], teacher[0])
+    assert output.scores is not None
     assert len(output.scores) == 3
     assert all(score.shape[-1] == 6 for score in output.scores)
     assert streamer.ended is True
