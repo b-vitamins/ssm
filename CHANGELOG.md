@@ -8,6 +8,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ### Added
 - Initial scaffold with docs (API, DESIGN, ROADMAP), package layout under `src/ssm/`, and comprehensive test suite (contracts + goldens harness).
 - Contributor guide (AGENTS.md) with Conventional Commits and CHANGELOG policy.
+- Minimal GRU-backed `MambaLMHeadModel` forward pass wired for cache-aware decoding.
+- Generation helpers plus greedy/top-k/top-p/min-p sampling integration with coverage in CPU tests.
 ### Changed
 - Documented the required developer workflow to install dependencies on session start and to run `ruff`, `pyright`, and `pytest` before opening pull requests.
 - Simplified `scripts/regenerate_goldens.py` to rely on the editable install instead of mutating `sys.path`.
