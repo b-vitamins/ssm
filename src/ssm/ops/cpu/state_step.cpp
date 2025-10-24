@@ -2,7 +2,9 @@
 
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
+#include <ATen/cpu/vec/vec.h>
 
+#include <array>
 #include <cmath>
 #include <complex>
 
@@ -123,23 +125,65 @@ at::Tensor selective_state_step_cpu(
             const auto* A_row = A_ptr + d_idx * state_stride;
             auto* state_row = state_ptr + state_offset;
 
-            const auto B_slice =
-                scan_param_slice<scalar_t>(B_info, b, d_idx, 0);
-            const auto C_slice =
-                scan_param_slice<scalar_t>(C_info, b, d_idx, 0);
-            const auto* B_ptr = B_slice.ptr;
-            const auto* C_ptr = C_slice.ptr;
-            const auto B_stride = B_slice.stride;
-            const auto C_stride = C_slice.stride;
+            const auto B_row =
+                make_scan_param_row<scalar_t>(B_info, b, d_idx);
+            const auto C_row =
+                make_scan_param_row<scalar_t>(C_info, b, d_idx);
+            const auto* B_ptr = B_row.data(0);
+            const auto* C_ptr = C_row.data(0);
+            const auto B_stride = B_row.state_stride;
+            const auto C_stride = C_row.state_stride;
 
             scalar_t y_val = scalar_t(0);
 
-            for (const auto n : c10::irange(state_dim)) {
-              const auto decay = std::exp(dt_val * A_row[n]);
-              const auto drive = B_ptr[n * B_stride] * x_val;
-              const auto updated = decay * state_row[n] + dt_val * drive;
-              state_row[n] = updated;
-              y_val += updated * C_ptr[n * C_stride];
+            const bool vectorizable = B_stride == 1 && C_stride == 1;
+
+            if (vectorizable) {
+              using Vec = at::vec::Vectorized<scalar_t>;
+              constexpr auto kVecSize = Vec::size();
+              const auto limit = (state_dim / kVecSize) * kVecSize;
+
+              const Vec dt_vec(dt_val);
+              const Vec x_vec(x_val);
+
+              std::array<scalar_t, kVecSize> buffer{};
+
+              int64_t n = 0;
+              for (; n < limit; n += kVecSize) {
+                const auto A_vec = Vec::loadu(A_row + n);
+                const auto state_vec = Vec::loadu(state_row + n);
+                const auto B_vec = Vec::loadu(B_ptr + n);
+                const auto C_vec = Vec::loadu(C_ptr + n);
+
+                const auto decay_vec = (A_vec * dt_vec).exp();
+                const auto drive_vec = B_vec * x_vec;
+                const auto updated_vec =
+                    decay_vec * state_vec + dt_vec * drive_vec;
+
+                updated_vec.store(state_row + n);
+
+                const auto y_vec = updated_vec * C_vec;
+                y_vec.store(buffer.data());
+                for (const auto& value : buffer) {
+                  y_val += value;
+                }
+              }
+
+              for (; n < state_dim; ++n) {
+                const auto decay = std::exp(dt_val * A_row[n]);
+                const auto drive = B_ptr[n] * x_val;
+                const auto updated = decay * state_row[n] + dt_val * drive;
+                state_row[n] = updated;
+                y_val += updated * C_ptr[n];
+              }
+            } else {
+              for (const auto n : c10::irange(state_dim)) {
+                const auto decay = std::exp(dt_val * A_row[n]);
+                const auto drive = B_ptr[n * B_stride] * x_val;
+                const auto updated = decay * state_row[n] + dt_val * drive;
+                state_row[n] = updated;
+                y_val += updated * C_ptr[n * C_stride];
+              }
             }
 
             if (D_ptr != nullptr) {
