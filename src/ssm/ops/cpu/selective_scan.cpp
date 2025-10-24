@@ -2,7 +2,9 @@
 
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
+#include <ATen/cpu/vec/vec.h>
 
+#include <array>
 #include <cmath>
 #include <complex>
 #include <tuple>
@@ -108,37 +110,83 @@ std::tuple<at::Tensor, at::Tensor> selective_scan_cpu(
             const auto* A_row = A_ptr + d_idx * state_stride;
             auto* state_row = state_ptr + state_offset;
             auto* out_row = out_ptr + row_offset;
+            const auto* u_row = u_ptr + row_offset;
+            const auto* delta_row = delta_ptr + row_offset;
+            const auto* z_row =
+                z_ptr != nullptr ? z_ptr + row_offset : nullptr;
+
+            const auto B_row =
+                make_scan_param_row<scalar_t>(B_info, b, d_idx);
+            const auto C_row =
+                make_scan_param_row<scalar_t>(C_info, b, d_idx);
+
+            const auto d_skip =
+                D_ptr != nullptr ? D_ptr[d_idx] : scalar_t(0);
 
             for (const auto t : c10::irange(length)) {
-              const auto delta_val = delta_ptr[row_offset + t];
-              const auto u_val = u_ptr[row_offset + t];
+              const auto delta_val = delta_row[t];
+              const auto u_val = u_row[t];
+              const auto delta_u = delta_val * u_val;
 
-              const auto B_slice =
-                  scan_param_slice<scalar_t>(B_info, b, d_idx, t);
-              const auto C_slice =
-                  scan_param_slice<scalar_t>(C_info, b, d_idx, t);
-
-              const auto* B_ptr = B_slice.ptr;
-              const auto* C_ptr = C_slice.ptr;
-              const auto B_stride = B_slice.stride;
-              const auto C_stride = C_slice.stride;
+              const auto* B_ptr = B_row.data(t);
+              const auto* C_ptr = C_row.data(t);
+              const auto B_stride = B_row.state_stride;
+              const auto C_stride = C_row.state_stride;
 
               scalar_t y_val = scalar_t(0);
 
-              for (const auto n : c10::irange(state_dim)) {
+              auto scalar_update = [&](int64_t n) {
                 const auto decay = std::exp(delta_val * A_row[n]);
-                const auto drive = B_ptr[n * B_stride] * u_val;
-                const auto updated = decay * state_row[n] + delta_val * drive;
+                const auto drive = B_ptr[n * B_stride] * delta_u;
+                const auto updated = decay * state_row[n] + drive;
                 state_row[n] = updated;
                 y_val += updated * C_ptr[n * C_stride];
+              };
+
+              if constexpr (!c10::is_complex<scalar_t>::value &&
+                            at::vec::is_vec_specialized_for<scalar_t>::value) {
+                if (B_stride == 1 && C_stride == 1) {
+                  using Vec = at::vec::Vectorized<scalar_t>;
+                  const auto vec_size = Vec::size();
+                  const Vec delta_vec(delta_val);
+                  const Vec delta_u_vec(delta_u);
+                  Vec y_vec = Vec(scalar_t(0));
+                  int64_t n = 0;
+                  for (; n + vec_size <= state_dim; n += vec_size) {
+                    auto a_vec = Vec::loadu(A_row + n);
+                    auto prev_state = Vec::loadu(state_row + n);
+                    auto b_vec = Vec::loadu(B_ptr + n);
+                    auto c_vec = Vec::loadu(C_ptr + n);
+                    auto decay_vec = (a_vec * delta_vec).exp();
+                    auto updated = decay_vec * prev_state + b_vec * delta_u_vec;
+                    y_vec = y_vec + updated * c_vec;
+                    updated.store(state_row + n);
+                  }
+                  alignas(alignof(scalar_t)) std::array<scalar_t, Vec::size()> buf{};
+                  y_vec.store(buf.data());
+                  for (const auto value : buf) {
+                    y_val += value;
+                  }
+                  for (; n < state_dim; ++n) {
+                    scalar_update(n);
+                  }
+                } else {
+                  for (const auto n : c10::irange(state_dim)) {
+                    scalar_update(n);
+                  }
+                }
+              } else {
+                for (const auto n : c10::irange(state_dim)) {
+                  scalar_update(n);
+                }
               }
 
               if (D_ptr != nullptr) {
-                y_val += D_ptr[d_idx] * u_val;
+                y_val += d_skip * u_val;
               }
 
-              if (z_ptr != nullptr) {
-                y_val *= z_ptr[row_offset + t];
+              if (z_row != nullptr) {
+                y_val *= z_row[t];
               }
 
               out_row[t] = y_val;

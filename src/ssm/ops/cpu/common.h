@@ -162,6 +162,24 @@ struct ParamSlice {
 };
 
 template <typename scalar_t>
+struct ScanParamRowView {
+  const scalar_t* base{nullptr};
+  int64_t state_stride{0};
+  int64_t time_stride{0};
+  int64_t time_size{1};
+  bool has_time{false};
+
+  inline const scalar_t* data(int64_t time_index) const {
+    if (!has_time) {
+      return base;
+    }
+    const auto resolved = time_size == 1 ? 0 : time_index;
+    TORCH_INTERNAL_ASSERT_DEBUG_ONLY(resolved < time_size);
+    return base + resolved * time_stride;
+  }
+};
+
+template <typename scalar_t>
 inline ParamSlice<scalar_t> scan_param_slice(const ScanParamInfo& info,
                                              int64_t batch, int64_t dim,
                                              int64_t t) {
@@ -182,6 +200,29 @@ inline ParamSlice<scalar_t> scan_param_slice(const ScanParamInfo& info,
       auto offset = batch * info.stride_batch + group * info.stride_group +
                     time_index * info.stride_time;
       return {base + offset, info.stride_state};
+    }
+  }
+  TORCH_INTERNAL_ASSERT(false, "Unknown scan parameter kind");
+}
+
+template <typename scalar_t>
+inline ScanParamRowView<scalar_t> make_scan_param_row(
+    const ScanParamInfo& info, int64_t batch, int64_t dim) {
+  const auto* base = info.tensor.data_ptr<scalar_t>();
+  switch (info.kind) {
+    case ScanParamKind::kShared: {
+      auto offset = dim * info.stride_dim;
+      return {base + offset, info.stride_state, 0, 1, false};
+    }
+    case ScanParamKind::kPerBatch: {
+      auto offset = batch * info.stride_batch + dim * info.stride_dim;
+      return {base + offset, info.stride_state, 0, 1, false};
+    }
+    case ScanParamKind::kGroupedTime: {
+      auto group = dim / info.dim_per_group;
+      auto offset = batch * info.stride_batch + group * info.stride_group;
+      return {base + offset, info.stride_state, info.stride_time,
+              info.time_size, true};
     }
   }
   TORCH_INTERNAL_ASSERT(false, "Unknown scan parameter kind");

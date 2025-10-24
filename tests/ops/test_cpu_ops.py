@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import itertools
-from typing import cast
+import json
+from pathlib import Path
+from typing import TypedDict, cast
 
 import pytest
 import torch
@@ -12,10 +14,77 @@ import ssm.ops as ops
 from ssm.ops.python import reference as reference_ops
 
 
+_SELECTIVE_SCAN_GOLDEN = (
+    Path(__file__).resolve().parents[1]
+    / "goldens"
+    / "ops"
+    / "selective_scan_reference.json"
+)
+
+
+class _SelectiveScanInputs(TypedDict):
+    u: torch.Tensor
+    delta: torch.Tensor
+    A: torch.Tensor
+    B: torch.Tensor
+    C: torch.Tensor
+    D: torch.Tensor | None
+    z: torch.Tensor | None
+    dt_bias: torch.Tensor | None
+
+
+class _SelectiveScanOutputs(TypedDict):
+    y: torch.Tensor
+    state: torch.Tensor
+
+
+class _SelectiveScanCase(TypedDict):
+    description: str
+    inputs: _SelectiveScanInputs
+    outputs: _SelectiveScanOutputs
+
+
 def _require_cpu_backend() -> None:
     status = ops._cpu_backend_status()
     if not status.available:
         pytest.skip(f"CPU backend unavailable: {status}")
+
+
+def _tensor_from_spec(spec: dict[str, object]) -> torch.Tensor:
+    """Reconstruct a tensor from the serialized JSON specification."""
+
+    dtype_name = cast(str, spec["dtype"])
+    dtype = getattr(torch, dtype_name)
+    data = torch.tensor(spec["data"], dtype=dtype)
+    shape = tuple(cast(list[int], spec["shape"]))
+    return data.view(shape)
+
+
+def _maybe_tensor(value: object) -> object:
+    if isinstance(value, dict) and {"dtype", "shape", "data"} <= value.keys():
+        return _tensor_from_spec(cast(dict[str, object], value))
+    return value
+
+
+def _selective_scan_golden_cases() -> list[tuple[str, _SelectiveScanCase]]:
+    if not _SELECTIVE_SCAN_GOLDEN.exists():
+        return []
+    with _SELECTIVE_SCAN_GOLDEN.open("r", encoding="utf-8") as handle:
+        encoded_cases = json.load(handle)
+    cases: list[tuple[str, _SelectiveScanCase]] = []
+    for entry in encoded_cases:
+        decoded = {
+            "description": entry["description"],
+            "inputs": {
+                key: _maybe_tensor(value) for key, value in entry["inputs"].items()
+            },
+            "outputs": {
+                key: _maybe_tensor(value) for key, value in entry["outputs"].items()
+            },
+        }
+        case = cast(_SelectiveScanCase, decoded)
+        cases.append((case["description"], case))
+    return cases
 
 
 @pytest.mark.parametrize(
@@ -114,6 +183,60 @@ def test_selective_scan_cpu_gradcheck() -> None:
         return out.sum()
 
     assert torch.autograd.gradcheck(func, (u, delta, A, B, C), atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "case", _selective_scan_golden_cases(), ids=lambda entry: entry[0]
+)
+def test_selective_scan_cpu_golden(case: tuple[str, _SelectiveScanCase]) -> None:
+    name, payload = case
+    if not name:
+        pytest.skip("No golden cases available")
+    _require_cpu_backend()
+    inputs = payload["inputs"]
+    outputs = payload["outputs"]
+
+    def _maybe_clone(value: object) -> object:
+        if isinstance(value, torch.Tensor):
+            return value.clone()
+        return value
+
+    args = cast(
+        _SelectiveScanInputs,
+        {key: _maybe_clone(value) for key, value in inputs.items()},
+    )
+    golden_y = outputs["y"].clone()
+    golden_state = outputs["state"].clone()
+
+    cpu_out, cpu_state = ops.selective_scan(
+        args["u"],
+        args["delta"],
+        args["A"],
+        args["B"],
+        args["C"],
+        D=args["D"],
+        z=args["z"],
+        dt_bias=args["dt_bias"],
+        softplus=True,
+        return_last_state=True,
+    )
+    ref_out, ref_state = reference_ops.selective_scan(
+        args["u"],
+        args["delta"],
+        args["A"],
+        args["B"],
+        args["C"],
+        D=args["D"],
+        z=args["z"],
+        dt_bias=args["dt_bias"],
+        softplus=True,
+        return_last_state=True,
+    )
+
+    torch.testing.assert_close(cpu_out, golden_y, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(cpu_state, golden_state, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(ref_out, golden_y, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(ref_state, golden_state, atol=1e-6, rtol=1e-6)
 
 
 def test_selective_state_step_cpu_grouped_matches_reference() -> None:
