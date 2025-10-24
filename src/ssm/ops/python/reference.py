@@ -249,12 +249,27 @@ def selective_state_step(
         raise ValueError("A must have shape (D, N).")
     A_compute = A.to(compute_dtype)
 
-    B_expanded = _normalize_scan_param("B", B, batch, dim, state_dim, 1, compute_dtype)[
-        :, :, :, 0
-    ]
-    C_expanded = _normalize_scan_param("C", C, batch, dim, state_dim, 1, compute_dtype)[
-        :, :, :, 0
-    ]
+    def _expand_grouped_projection(name: str, param: torch.Tensor) -> torch.Tensor:
+        """Expand grouped projections ``(B, G, N)`` to ``(B, D, N)`` when needed."""
+
+        if param.dim() == 3 and param.shape[0] == batch and param.shape[1] != dim:
+            groups = param.shape[1]
+            if dim % groups != 0:
+                raise ValueError(f"{name} group dimension must divide D.")
+            if param.shape[2] != state_dim:
+                raise ValueError(f"{name} must have matching state dimension.")
+            param = param.repeat_interleave(dim // groups, dim=1)
+        return param
+
+    B_prepared = _expand_grouped_projection("B", B)
+    C_prepared = _expand_grouped_projection("C", C)
+
+    B_expanded = _normalize_scan_param(
+        "B", B_prepared, batch, dim, state_dim, 1, compute_dtype
+    )[:, :, :, 0]
+    C_expanded = _normalize_scan_param(
+        "C", C_prepared, batch, dim, state_dim, 1, compute_dtype
+    )[:, :, :, 0]
 
     if D is not None:
         if D.shape != (dim,):
