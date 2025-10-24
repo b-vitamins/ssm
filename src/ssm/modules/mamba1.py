@@ -65,7 +65,19 @@ class Mamba1(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, inference_params=None, **kwargs
     ) -> torch.Tensor:
-        """Apply the reference Mamba1 implementation."""
+        """Compute the reference Mamba1 forward pass.
+
+        Args:
+            hidden_states (torch.Tensor): Input tensor shaped ``(batch, seqlen, d_model)``.
+            inference_params: Optional inference helper parameters (unused for the reference path).
+            **kwargs: Additional keyword arguments kept for API compatibility.
+
+        Returns:
+            torch.Tensor: Output tensor with the same shape as ``hidden_states``.
+
+        Raises:
+            ValueError: If ``hidden_states`` does not have rank 3 with ``d_model`` features.
+        """
 
         if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.d_model:
             raise ValueError("hidden_states must have shape (B, L, d_model).")
@@ -110,14 +122,15 @@ class Mamba1(nn.Module):
         """Allocate decoding cache tensors for streaming inference.
 
         Args:
-            batch_size: Maximum batch size expected during decode.
-            max_seqlen: Unused but kept for API parity with fused kernels.
-            dtype: Optional dtype override for the cache tensors.
+            batch_size (int): Maximum batch size expected during decode.
+            max_seqlen (int): Upper bound on the decoded sequence length. Unused by the reference path.
+            dtype (torch.dtype | None): Optional dtype override for the cache tensors.
+            **kwargs: Additional keyword arguments accepted for API parity.
 
         Returns:
-            ``(conv_state, ssm_state)`` where ``conv_state`` has shape
-            ``(B, expand * d_model, d_conv)`` and ``ssm_state`` has shape
-            ``(B, expand * d_model, d_state)``.
+            tuple[torch.Tensor, torch.Tensor]: ``(conv_state, ssm_state)`` where ``conv_state``
+            is shaped ``(batch_size, expand * d_model, d_conv)`` and ``ssm_state`` is shaped
+            ``(batch_size, expand * d_model, d_state)``.
         """
 
         del max_seqlen  # Shape-independent for the reference implementation.
