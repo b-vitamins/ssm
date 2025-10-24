@@ -116,22 +116,23 @@ class Mamba1(nn.Module):
         z = gate.permute(0, 2, 1)
 
         A = -torch.exp(self.A_log)
-        output = cast(
-            torch.Tensor,
-            ops.selective_scan(
-                u=u,
-                delta=delta,
-                A=A,
-                B=self.B,
-                C=self.C,
-                D=self.D,
-                z=z,
-                dt_bias=self.dt_bias,
-                softplus=True,
-            ),
+        scan_out = ops.selective_scan(
+            u=u,
+            delta=delta,
+            A=A,
+            B=self.B,
+            C=self.C,
+            D=self.D,
+            z=z,
+            dt_bias=self.dt_bias,
+            softplus=True,
         )
+        if isinstance(scan_out, tuple):
+            output = scan_out[0]
+        else:
+            output = scan_out
 
-        output = output.permute(0, 2, 1)
+        output = cast(torch.Tensor, output).permute(0, 2, 1)
         return self.out_proj(output)
 
     def allocate_inference_cache(
