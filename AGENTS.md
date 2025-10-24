@@ -54,6 +54,7 @@
   - Categorize each entry beneath the appropriate subsection (`Added`, `Changed`, `Fixed`, `Removed`, or `Security`). Create the subsection if needed.
   - Use bullet points with concise, imperative descriptions that mention the affected area or component.
   - Do not duplicate historical entries; ensure each bullet appears exactly once in the changelog.
+  - Before committing or opening a PR, verify that any user-facing change is reflected in the "Unreleased" section and that the section exists with the necessary subsections. Document the PR number (if known) or a short context when updating the changelog.
   - Tooling (optional): `git-cliff` or `conventional-changelog` can help generate entries from commit history.
 - PRs: clear description, limited scope, link issues, include tests/docs, and call out API changes or migration notes. Add example commands if relevant.
 
