@@ -42,6 +42,10 @@
   - Examples: `feat(mamba2): add varlen seq_idx plumbing`, `fix(ops): handle empty chunk edge case`.
 - CHANGELOG: maintain `CHANGELOG.md` in the repository root. Update it for user‑visible changes per PR or during release.
   - Format: Keep a Changelog style with versions, dates, and categorized entries (Added/Changed/Fixed/Removed).
+  - Always add entries to the topmost "Unreleased" section. If it does not exist, create it following the existing structure.
+  - Categorize each entry beneath the appropriate subsection (`Added`, `Changed`, `Fixed`, `Removed`, or `Security`). Create the subsection if needed.
+  - Use bullet points with concise, imperative descriptions that mention the affected area or component.
+  - Do not duplicate historical entries; ensure each bullet appears exactly once in the changelog.
   - Tooling (optional): `git-cliff` or `conventional-changelog` can help generate entries from commit history.
 - PRs: clear description, limited scope, link issues, include tests/docs, and call out API changes or migration notes. Add example commands if relevant.
 
