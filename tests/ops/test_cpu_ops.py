@@ -87,6 +87,55 @@ def _selective_scan_golden_cases() -> list[tuple[str, _SelectiveScanCase]]:
     return cases
 
 
+def test_dw_causal_conv_cpu_matches_reference() -> None:
+    _require_cpu_backend()
+    torch.manual_seed(0)
+
+    batch, channels, length = 2, 3, 11
+    kernel_sizes = [1, 3, 5]
+    activations = ["identity", "relu", "silu"]
+    dtypes = [torch.float32, torch.float64, torch.bfloat16]
+
+    for dtype in dtypes:
+        atol = 1e-5
+        rtol = 1e-5
+        if dtype == torch.bfloat16:
+            atol = 2e-3
+            rtol = 2e-3
+        for channels_first in (True, False):
+            base_shape = (batch, channels, length)
+            x = torch.randn(base_shape, dtype=dtype)
+            if not channels_first:
+                x = x.permute(0, 2, 1).contiguous()
+            for kernel_size in kernel_sizes:
+                weight = torch.randn(channels, kernel_size, dtype=dtype)
+                bias = torch.randn(channels, dtype=dtype)
+                for activation in activations:
+                    for use_bias in (False, True):
+                        bias_arg = bias if use_bias else None
+                        for weight_layout in ("ck", "c1k"):
+                            weight_arg = (
+                                weight if weight_layout == "ck" else weight.unsqueeze(1)
+                            )
+                            out_cpu = ops.dw_causal_conv(
+                                x,
+                                weight_arg,
+                                bias_arg,
+                                activation=activation,
+                            )
+                            out_ref = reference_ops.dw_causal_conv(
+                                x,
+                                weight_arg,
+                                bias=bias_arg,
+                                activation=activation,
+                            )
+                            assert out_cpu.shape == x.shape
+                            assert out_cpu.dtype == x.dtype
+                            torch.testing.assert_close(
+                                out_cpu, out_ref, atol=atol, rtol=rtol
+                            )
+
+
 @pytest.mark.parametrize(
     "B_shape,C_shape",
     [
@@ -353,32 +402,6 @@ def test_ssd_chunk_scan_cpu_varlen_and_grouped() -> None:
         z=z,
         seq_meta={"cu_seqlens": cu_seqlens},
         initial_states=init_state,
-    )
-
-    torch.testing.assert_close(cpu_out, ref_out, atol=1e-5, rtol=1e-5)
-
-
-@pytest.mark.parametrize("channels_first", [True, False])
-def test_dw_causal_conv_cpu_matches_reference(channels_first: bool) -> None:
-    _require_cpu_backend()
-    torch.manual_seed(5)
-    batch, channels, length, kernel = 2, 3, 9, 4
-    layout = (batch, channels, length) if channels_first else (batch, length, channels)
-    x = torch.randn(layout)
-    weight = torch.randn(channels, 1, kernel)
-    bias = torch.randn(channels)
-
-    ref_out = reference_ops.dw_causal_conv(
-        x,
-        weight,
-        bias=bias,
-        activation="identity",
-    )
-    cpu_out = ops.dw_causal_conv(
-        x,
-        weight,
-        bias=bias,
-        activation="identity",
     )
 
     torch.testing.assert_close(cpu_out, ref_out, atol=1e-5, rtol=1e-5)
