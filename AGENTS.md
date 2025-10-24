@@ -1,5 +1,13 @@
 # Repository Guidelines
 
+> **MANDATORY QUALITY GATE**
+>
+> Before opening **or updating** any pull request, you must run the
+> following commands locally and ensure they succeed, in this exact order:
+> `ruff format .`, `ruff check .`, `pyright`, and `pytest -q`. Capture the
+> command outputs and include them in the PR discussion as evidence. Skipping
+> these steps is not allowed.
+
 ## Project Structure & Module Organization
 - Source: `src/ssm/`
   - `modules/` (Mamba1, Mamba2, MHA, Block, GatedMLP stubs)

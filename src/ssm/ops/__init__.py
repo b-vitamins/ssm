@@ -16,7 +16,7 @@ except ImportError:  # pragma: no cover - torch utils missing
     _load_extension = None
 
 
-_CPU_OPS = None
+_CPU_OPS: Any = None
 _CPU_LOAD_ERROR: Optional[Exception] = None
 
 
@@ -38,7 +38,7 @@ def _cpu_sources() -> list[str]:
     ]
 
 
-def _load_cpu_ops() -> Optional[object]:
+def _load_cpu_ops() -> Optional[Any]:
     global _CPU_OPS, _CPU_LOAD_ERROR
     if _CPU_OPS is not None:
         return _CPU_OPS
@@ -61,7 +61,7 @@ def _load_cpu_ops() -> Optional[object]:
         return None
 
 
-def _should_use_cpu(*tensors: torch.Tensor) -> bool:
+def _should_use_cpu(*tensors: Optional[torch.Tensor]) -> bool:
     return all(t.device.type == "cpu" for t in tensors if isinstance(t, torch.Tensor))
 
 
@@ -295,4 +295,3 @@ selective_state_step.__doc__ = reference_ops.selective_state_step.__doc__
 ssd_chunk_scan.__doc__ = reference_ops.ssd_chunk_scan.__doc__
 dw_causal_conv.__doc__ = reference_ops.dw_causal_conv.__doc__
 fused_layer_norm.__doc__ = reference_ops.fused_layer_norm.__doc__
-
