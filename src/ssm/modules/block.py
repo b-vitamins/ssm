@@ -104,9 +104,14 @@ class Block(nn.Module):
             TypeError: If a fused residual is requested with an unsupported norm.
         """
 
-        residual = hidden_states if residual is None else (hidden_states + residual)
+        residual_input = residual
 
         if not self.fused_add_norm:
+            residual = (
+                hidden_states
+                if residual_input is None
+                else hidden_states + residual_input
+            )
             norm_dtype = _norm_weight_dtype(self.norm, residual.dtype)
             hidden_states = self.norm(residual.to(dtype=norm_dtype))
             if self.residual_in_fp32:
@@ -118,7 +123,7 @@ class Block(nn.Module):
                 hidden_states,
                 self.norm.weight,
                 self.norm.bias,
-                residual=residual,
+                residual=residual_input,
                 prenorm=True,
                 residual_in_fp32=self.residual_in_fp32,
                 eps=self.norm.eps,
