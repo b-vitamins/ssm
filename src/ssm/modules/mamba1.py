@@ -1,38 +1,15 @@
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch import nn
 
+from ssm import ops
+
 
 class Mamba1(nn.Module):
-    """Selective SSM (Mamba v1) block.
-
-    This is a design-first stub. The implementation is provided by fused ops
-    in `ssm.ops` once available. Until then, the forward raises
-    NotImplementedError to enforce contract clarity.
-
-    Args:
-        d_model: Model embedding dimension.
-        d_state: Internal SSM state dimension expansion.
-        d_conv: Local depthwise conv width (causal).
-        expand: Block expansion factor. Inner dim is `expand * d_model`.
-        dt_min: Lower bound for softplus(dt_bias) at init (documentation only).
-        dt_max: Upper bound for softplus(dt_bias) at init (documentation only).
-        dt_init_floor: Min floor for dt during initialization (documentation only).
-        bias: If True, enables bias in linear projections.
-        conv_bias: If True, enables bias in the depthwise conv.
-        use_fast_path: If True, dispatches to fused kernel backend when available.
-        layer_idx: Optional layer index for inference cache addressing.
-        device: Optional device to initialize parameters on.
-        dtype: Optional dtype for parameter initialization.
-
-    Shape:
-        - Input: `hidden_states` of shape `(B, L, D)` where `D == d_model`.
-        - Output: tensor of shape `(B, L, D)`.
-
-    Raises:
-        NotImplementedError: Always, until an op backend is provided.
-    """
+    """Selective SSM (Mamba v1) block backed by the reference ops."""
 
     def __init__(
         self,
@@ -51,35 +28,77 @@ class Mamba1(nn.Module):
         dtype=None,
     ) -> None:
         super().__init__()
+        del dt_min, dt_max, dt_init_floor  # Documented for parity with fused kernels.
+
         self.d_model = d_model
         self.d_state = d_state
         self.d_conv = d_conv
         self.expand = expand
+        self.inner_dim = expand * d_model
         self.layer_idx = layer_idx
         self.use_fast_path = use_fast_path
 
-        # Parameters are intentionally not allocated here to avoid implying a
-        # specific implementation. Implementations will define and register
-        # parameters when added.
+        factory_kwargs: dict[str, Any] = {}
+        if device is not None:
+            factory_kwargs["device"] = device
+        if dtype is not None:
+            factory_kwargs["dtype"] = dtype
+
+        self.in_proj = nn.Linear(d_model, 2 * self.inner_dim, bias=bias, **factory_kwargs)
+        self.out_proj = nn.Linear(self.inner_dim, d_model, bias=bias, **factory_kwargs)
+        self.dt_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=True, **factory_kwargs)
+
+        conv_weight = torch.randn(self.inner_dim, d_conv, **factory_kwargs) * 0.02
+        self.conv_weight = nn.Parameter(conv_weight)
+        if conv_bias:
+            self.conv_bias = nn.Parameter(torch.zeros(self.inner_dim, **factory_kwargs))
+        else:
+            self.register_parameter("conv_bias", None)
+
+        # Selective scan parameterisation (broadcast to ops contract).
+        self.A_log = nn.Parameter(torch.zeros(self.inner_dim, d_state, **factory_kwargs))
+        self.B = nn.Parameter(torch.randn(self.inner_dim, d_state, **factory_kwargs) * 0.02)
+        self.C = nn.Parameter(torch.randn(self.inner_dim, d_state, **factory_kwargs) * 0.02)
+        self.D = nn.Parameter(torch.ones(self.inner_dim, **factory_kwargs))
+        self.dt_bias = nn.Parameter(torch.zeros(self.inner_dim, **factory_kwargs))
 
     def forward(
         self, hidden_states: torch.Tensor, inference_params=None, **kwargs
     ) -> torch.Tensor:
-        """Apply the Mamba1 block.
+        """Apply the reference Mamba1 implementation."""
 
-        Args:
-            hidden_states: Input tensor `(B, L, D)`.
-            inference_params: Optional decoding cache handle; if provided, the
-                forward may execute in step mode.
-            **kwargs: Reserved for future options (e.g., z gating toggles).
+        if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.d_model:
+            raise ValueError("hidden_states must have shape (B, L, d_model).")
 
-        Returns:
-            torch.Tensor: Output tensor `(B, L, D)`.
+        projected, gate = self.in_proj(hidden_states).chunk(2, dim=-1)
 
-        Raises:
-            NotImplementedError: Implementation to be supplied in ops backends.
-        """
-        raise NotImplementedError("Mamba1.forward is not implemented in the scaffold.")
+        conv_input = projected.permute(0, 2, 1)
+        conv_out = ops.dw_causal_conv(
+            conv_input,
+            self.conv_weight,
+            bias=self.conv_bias,
+            activation="silu",
+        ).permute(0, 2, 1)
+
+        delta = self.dt_proj(conv_out).permute(0, 2, 1)
+        u = conv_out.permute(0, 2, 1)
+        z = gate.permute(0, 2, 1)
+
+        A = -torch.exp(self.A_log)
+        output = ops.selective_scan(
+            u=u,
+            delta=delta,
+            A=A,
+            B=self.B,
+            C=self.C,
+            D=self.D,
+            z=z,
+            dt_bias=self.dt_bias,
+            softplus=True,
+        )
+
+        output = output.permute(0, 2, 1)
+        return self.out_proj(output)
 
     def allocate_inference_cache(
         self,
@@ -87,24 +106,41 @@ class Mamba1(nn.Module):
         max_seqlen: int,
         dtype: torch.dtype | None = None,
         **kwargs,
-    ):
-        """Allocate decoding cache tensors for step-wise inference.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Allocate decoding cache tensors for streaming inference.
 
         Args:
-            batch_size: Max batch size expected during decoding.
-            max_seqlen: Max target sequence length for decoding.
-            dtype: Optional dtype for states; if None, selects per-backend default.
-            **kwargs: Reserved for backend-specific knobs.
+            batch_size: Maximum batch size expected during decode.
+            max_seqlen: Unused but kept for API parity with fused kernels.
+            dtype: Optional dtype override for the cache tensors.
 
         Returns:
-            tuple[torch.Tensor, torch.Tensor]: `(conv_state, ssm_state)` where
-            - `conv_state`: `(B, expand * d_model, d_conv)` state for the depthwise conv.
-            - `ssm_state`: `(B, expand * d_model, d_state)` state for the SSM.
-
-        Note:
-            This stub defines the expected shapes but does not allocate tensors.
-            Implementations must return real tensors matching the above shapes.
+            ``(conv_state, ssm_state)`` where ``conv_state`` has shape
+            ``(B, expand * d_model, d_conv)`` and ``ssm_state`` has shape
+            ``(B, expand * d_model, d_state)``.
         """
-        raise NotImplementedError(
-            "Mamba1.allocate_inference_cache is not implemented in the scaffold."
+
+        del max_seqlen  # Shape-independent for the reference implementation.
+
+        param = next(self.parameters(), None)
+        device = param.device if param is not None else torch.device("cpu")
+        cache_dtype = dtype or (
+            param.dtype if param is not None else torch.get_default_dtype()
         )
+
+        conv_state = torch.zeros(
+            batch_size,
+            self.inner_dim,
+            self.d_conv,
+            device=device,
+            dtype=cache_dtype,
+        )
+        ssm_state = torch.zeros(
+            batch_size,
+            self.inner_dim,
+            self.d_state,
+            device=device,
+            dtype=cache_dtype,
+        )
+        return conv_state, ssm_state
+

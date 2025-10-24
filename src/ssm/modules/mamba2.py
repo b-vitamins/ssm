@@ -1,42 +1,16 @@
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch import nn
+from torch.nn import functional as F
+
+from ssm import ops
 
 
 class Mamba2(nn.Module):
-    """State Space Dual (Mamba v2) block.
-
-    This is a design-first stub. The implementation is provided by fused ops
-    in `ssm.ops` once available. Until then, the forward raises
-    NotImplementedError to enforce contract clarity.
-
-    Args:
-        d_model: Model embedding dimension.
-        d_state: Per-head SSM state dimension.
-        d_conv: Local depthwise conv width (causal).
-        headdim: Head dimension for SSD formulation.
-        expand: Block expansion factor. Inner dim is `expand * d_model`.
-        ngroups: Number of SSM groups for B/C branches.
-        d_ssm: If set, number of inner dims using SSM; remainder uses gated MLP.
-        chunk_size: SSD chunk length for chunked scan.
-        bias: If True, enables bias in linear projections.
-        conv_bias: If True, enables bias in the depthwise conv.
-        layer_idx: Optional layer index for inference cache addressing.
-        device: Optional device to initialize parameters on.
-        dtype: Optional dtype for parameter initialization.
-
-    Shape:
-        - Input: `hidden_states` of shape `(B, L, D)` where `D == d_model`.
-        - Output: tensor of shape `(B, L, D)`.
-
-    Varlen:
-        - `seq_idx`: `(1, total_tokens)` int32 mapping positions to batch elements.
-        - `cu_seqlens`: `(B + 1,)` int32 cumulative lengths for ragged batches.
-
-    Raises:
-        NotImplementedError: Always, until an op backend is provided.
-    """
+    """State Space Dual (Mamba v2) block implemented with reference ops."""
 
     def __init__(
         self,
@@ -55,15 +29,130 @@ class Mamba2(nn.Module):
         dtype=None,
     ) -> None:
         super().__init__()
+
+        if expand * d_model % headdim != 0:
+            raise ValueError("expand * d_model must be divisible by headdim.")
+
         self.d_model = d_model
         self.d_state = d_state
         self.d_conv = d_conv
         self.headdim = headdim
         self.expand = expand
         self.ngroups = ngroups
-        self.d_ssm = d_ssm
         self.chunk_size = chunk_size
         self.layer_idx = layer_idx
+
+        self.inner_dim = expand * d_model
+        self.nheads = self.inner_dim // headdim
+        self.ssm_dim = d_ssm if d_ssm is not None else self.inner_dim
+        if self.ssm_dim < 0 or self.ssm_dim > self.inner_dim:
+            raise ValueError("d_ssm must lie within [0, expand * d_model].")
+        if self.ssm_dim % headdim != 0:
+            raise ValueError("d_ssm must be divisible by headdim for head packing.")
+        self.ssm_heads = self.ssm_dim // headdim
+        self.mlp_dim = self.inner_dim - self.ssm_dim
+
+        factory_kwargs: dict[str, Any] = {}
+        if device is not None:
+            factory_kwargs["device"] = device
+        if dtype is not None:
+            factory_kwargs["dtype"] = dtype
+
+        self.in_proj = nn.Linear(d_model, self.inner_dim, bias=bias, **factory_kwargs)
+        self.gate_proj = nn.Linear(d_model, self.inner_dim, bias=bias, **factory_kwargs)
+        self.out_proj = nn.Linear(self.inner_dim, d_model, bias=bias, **factory_kwargs)
+
+        conv_weight = torch.randn(self.inner_dim, d_conv, **factory_kwargs) * 0.02
+        self.conv_weight = nn.Parameter(conv_weight)
+        if conv_bias:
+            self.conv_bias = nn.Parameter(torch.zeros(self.inner_dim, **factory_kwargs))
+        else:
+            self.register_parameter("conv_bias", None)
+
+        # Per-head SSM parameters broadcast by the chunked scan.
+        self.dt_proj_weight = nn.Parameter(
+            torch.randn(self.nheads, headdim, **factory_kwargs) * 0.02
+        )
+        self.dt_proj_bias = nn.Parameter(torch.zeros(self.nheads, **factory_kwargs))
+        self.A_log = nn.Parameter(torch.zeros(self.nheads, headdim, **factory_kwargs))
+        self.B = nn.Parameter(torch.randn(self.nheads, headdim, **factory_kwargs) * 0.02)
+        self.C = nn.Parameter(torch.randn(self.nheads, headdim, **factory_kwargs) * 0.02)
+        self.D = nn.Parameter(torch.ones(self.nheads, headdim, **factory_kwargs))
+
+        if self.mlp_dim > 0:
+            self.mlp = nn.Linear(self.mlp_dim, self.mlp_dim, bias=bias, **factory_kwargs)
+        else:
+            self.register_module("mlp", None)
+
+    def _forward_impl(
+        self, hidden_states: torch.Tensor, seq_lens: torch.Tensor | None
+    ) -> torch.Tensor:
+        if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.d_model:
+            raise ValueError("hidden_states must have shape (B, L, d_model).")
+
+        batch, seqlen, _ = hidden_states.shape
+
+        projected = self.in_proj(hidden_states)
+        conv_input = projected.permute(0, 2, 1)
+        conv_out = ops.dw_causal_conv(
+            conv_input,
+            self.conv_weight,
+            bias=self.conv_bias,
+            activation="silu",
+        ).permute(0, 2, 1)
+
+        gate = torch.sigmoid(self.gate_proj(hidden_states))
+
+        if self.ssm_dim > 0:
+            ssm_in = conv_out[..., : self.ssm_dim]
+            X = ssm_in.view(batch, seqlen, self.ssm_heads, self.headdim)
+            dt = torch.einsum(
+                "blhp,hp->blh", X, self.dt_proj_weight[: self.ssm_heads]
+            ) + self.dt_proj_bias[: self.ssm_heads]
+            dt = F.softplus(dt)
+
+            seq_meta = None
+            lengths_tensor: torch.Tensor | None = None
+            if seq_lens is not None:
+                lengths_tensor = seq_lens.to(dtype=torch.long, device=hidden_states.device)
+                seq_meta = {"seq_lens": lengths_tensor.tolist()}
+
+            ssm_out = ops.ssd_chunk_scan(
+                X=X,
+                dt=dt,
+                A=-torch.exp(self.A_log[: self.ssm_heads]),
+                B=self.B[: self.ssm_heads],
+                C=self.C[: self.ssm_heads],
+                chunk_size=self.chunk_size,
+                D=self.D[: self.ssm_heads],
+                z=None,
+                seq_meta=seq_meta,
+            )
+            ssm_out = ssm_out.view(batch, seqlen, self.ssm_dim)
+        else:
+            ssm_out = hidden_states.new_zeros(batch, seqlen, 0)
+            lengths_tensor = seq_lens.to(dtype=torch.long, device=hidden_states.device) if seq_lens is not None else None
+
+        if self.mlp_dim > 0:
+            mlp_in = conv_out[..., self.ssm_dim :]
+            mlp_out = F.silu(self.mlp(mlp_in))
+        else:
+            mlp_out = hidden_states.new_zeros(batch, seqlen, 0)
+
+        combined = torch.cat([ssm_out, mlp_out], dim=-1)
+        combined = combined * gate
+
+        if seq_lens is not None:
+            assert lengths_tensor is not None
+            mask = (
+                torch.arange(seqlen, device=hidden_states.device)
+                .unsqueeze(0)
+                .expand(batch, seqlen)
+                < lengths_tensor.unsqueeze(1)
+            )
+            combined = combined * mask.unsqueeze(-1)
+
+        return self.out_proj(combined)
 
     def forward(
         self,
@@ -73,23 +162,91 @@ class Mamba2(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Apply the Mamba2 block.
+        if inference_params is not None:
+            raise NotImplementedError("Inference cache stepping is not implemented.")
 
-        Args:
-            hidden_states: Input tensor `(B, L, D)`.
-            inference_params: Optional decoding cache handle; if provided, the
-                forward may execute in step mode.
-            seq_idx: Optional varlen index mapping positions to batch samples.
-            cu_seqlens: Optional cumulative sequence lengths for varlen batches.
-            **kwargs: Reserved for future options.
+        if cu_seqlens is None:
+            if seq_idx is not None:
+                raise ValueError("seq_idx provided without cu_seqlens metadata.")
+            return self._forward_impl(hidden_states, seq_lens=None)
 
-        Returns:
-            torch.Tensor: Output tensor `(B, L, D)`.
+        if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+            raise ValueError("cu_seqlens must be a 1-D tensor of length B + 1.")
 
-        Raises:
-            NotImplementedError: Implementation to be supplied in ops backends.
-        """
-        raise NotImplementedError("Mamba2.forward is not implemented in the scaffold.")
+        seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
+        batch = seq_lens.numel()
+        total_tokens = int(seq_lens.sum().item())
+
+        def _normalize_seq_idx(idx: torch.Tensor) -> torch.Tensor:
+            if idx.ndim == 2:
+                if idx.shape[0] != 1:
+                    raise ValueError("seq_idx must broadcast with the flattened batch dimension.")
+                idx = idx[0]
+            if idx.ndim != 1:
+                raise ValueError("seq_idx must be rank-1 (or (1, T) for cu_seqlens routing).")
+            if idx.numel() != total_tokens:
+                raise ValueError("seq_idx must have the same number of tokens as hidden_states.")
+            idx = idx.to(device=hidden_states.device, dtype=torch.long)
+            if torch.any(idx < 0) or torch.any(idx >= batch):
+                raise ValueError("seq_idx entries must index sequences in [0, B).")
+            return idx
+
+        if hidden_states.ndim == 3 and hidden_states.shape[0] == batch:
+            return self._forward_impl(hidden_states, seq_lens=seq_lens)
+
+        if hidden_states.ndim == 3 and hidden_states.shape[0] == 1:
+            if hidden_states.shape[1] != total_tokens:
+                raise ValueError("Flattened tokens must match cu_seqlens total length.")
+            flat = hidden_states[0]
+            keep_batch_dim = True
+        elif hidden_states.ndim == 2:
+            if hidden_states.shape[0] != total_tokens:
+                raise ValueError("Flattened tokens must match cu_seqlens total length.")
+            flat = hidden_states
+            keep_batch_dim = False
+        else:
+            raise ValueError("Unsupported hidden_states layout for varlen routing.")
+
+        if seq_idx is not None:
+            seq_idx = _normalize_seq_idx(seq_idx)
+
+        max_len = int(seq_lens.max().item()) if batch > 0 else 0
+        padded = hidden_states.new_zeros(batch, max_len, self.d_model)
+
+        scatter_positions: list[torch.Tensor] = []
+        cursor = 0
+        for b, length in enumerate(seq_lens.tolist()):
+            if length == 0:
+                scatter_positions.append(torch.empty(0, dtype=torch.long, device=hidden_states.device))
+                continue
+            if seq_idx is None:
+                positions = torch.arange(
+                    cursor,
+                    cursor + length,
+                    device=hidden_states.device,
+                    dtype=torch.long,
+                )
+            else:
+                positions = (seq_idx == b).nonzero(as_tuple=False).squeeze(-1)
+                if positions.numel() != length:
+                    raise ValueError("seq_idx counts must agree with cu_seqlens lengths.")
+            padded[b, :length] = flat.index_select(0, positions)
+            scatter_positions.append(positions)
+            if seq_idx is None:
+                cursor += length
+
+        dense_out = self._forward_impl(padded, seq_lens=seq_lens)
+
+        routed = flat.new_zeros(total_tokens, self.d_model)
+        for b, length in enumerate(seq_lens.tolist()):
+            if length == 0:
+                continue
+            positions = scatter_positions[b]
+            routed.index_copy_(0, positions, dense_out[b, :length])
+
+        if keep_batch_dim:
+            return routed.unsqueeze(0)
+        return routed
 
     def allocate_inference_cache(
         self,
@@ -97,22 +254,35 @@ class Mamba2(nn.Module):
         max_seqlen: int,
         dtype: torch.dtype | None = None,
         **kwargs,
-    ):
-        """Allocate decoding cache tensors for step-wise inference.
-
-        Args:
-            batch_size: Max batch size expected during decoding.
-            max_seqlen: Max target sequence length for decoding.
-            dtype: Optional dtype for states; if None, selects per-backend default.
-            **kwargs: Reserved for backend-specific knobs.
+    ) -> dict[str, torch.Tensor]:
+        """Allocate decoding cache tensors for streaming inference.
 
         Returns:
-            Any: Backend-specific structure describing the cache (e.g., tuple or dict).
-
-        Note:
-            This stub defines the expected contract but does not allocate tensors.
-            Implementations must return real structures matching the documented shapes.
+            Dict with ``conv_state`` ``(B, expand * d_model, d_conv)`` and
+            ``ssd_state`` ``(B, ssm_heads, headdim)`` entries.
         """
-        raise NotImplementedError(
-            "Mamba2.allocate_inference_cache is not implemented in the scaffold."
+
+        del max_seqlen
+
+        param = next(self.parameters(), None)
+        device = param.device if param is not None else torch.device("cpu")
+        cache_dtype = dtype or (
+            param.dtype if param is not None else torch.get_default_dtype()
         )
+
+        conv_state = torch.zeros(
+            batch_size,
+            self.inner_dim,
+            self.d_conv,
+            device=device,
+            dtype=cache_dtype,
+        )
+        ssd_state = torch.zeros(
+            batch_size,
+            self.ssm_heads,
+            self.headdim,
+            device=device,
+            dtype=cache_dtype,
+        )
+        return {"conv_state": conv_state, "ssd_state": ssd_state}
+
