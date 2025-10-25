@@ -3,9 +3,11 @@
 #include <ATen/ATen.h>
 #include <ATen/AccumulateType.h>
 #include <ATen/Parallel.h>
+#include <ATen/cpu/vec/vec.h>
 
 #include <c10/util/TypeTraits.h>
 
+#include <algorithm>
 #include <cmath>
 
 namespace ssm {
@@ -71,6 +73,10 @@ at::Tensor fused_layer_norm_cpu(
         auto* out_ptr = output.data_ptr<scalar_t>();
 
         const auto row_stride = dim;
+        const bool has_residual = residual_ptr != nullptr;
+        const bool add_pre = prenorm && has_residual;
+        const bool add_post = !prenorm && has_residual;
+        const bool has_bias = bias_ptr != nullptr;
 
         at::parallel_for(0, batch * length, 0,
                          [&](int64_t start, int64_t end) {
@@ -82,22 +88,56 @@ at::Tensor fused_layer_norm_cpu(
 
                              const auto* x_row = x_ptr + offset;
                              const auto* residual_row =
-                                 residual_ptr != nullptr
-                                     ? residual_ptr + offset
-                                     : nullptr;
+                                 has_residual ? residual_ptr + offset : nullptr;
                              auto* out_row = out_ptr + offset;
 
                              acc_t sum = static_cast<acc_t>(0);
                              acc_t sumsq = static_cast<acc_t>(0);
 
-                             for (const auto d : c10::irange(dim)) {
-                               auto value = x_row[d];
-                               if (prenorm && residual_row != nullptr) {
-                                 value = value + residual_row[d];
+                             if constexpr (!c10::is_complex<scalar_t>::value) {
+                               using Vec = at::vec::Vectorized<scalar_t>;
+                               constexpr auto kWidth = Vec::size();
+                               Vec vsum = Vec(scalar_t(0));
+                               Vec vsumsq = Vec(scalar_t(0));
+                               int64_t d = 0;
+                               for (; d + kWidth <= dim; d += kWidth) {
+                                 auto vx = Vec::loadu(x_row + d);
+                                 if (add_pre) {
+                                   vx = vx + Vec::loadu(residual_row + d);
+                                 }
+                                 vsum = vsum + vx;
+                                 vsumsq = vsumsq + vx * vx;
                                }
-                               const acc_t val_acc = static_cast<acc_t>(value);
-                               sum += val_acc;
-                               sumsq += val_acc * val_acc;
+                               if (d != 0) {
+                                 alignas(64) scalar_t buffer[kWidth];
+                                 vsum.store(buffer);
+                                 for (const auto lane : c10::irange(kWidth)) {
+                                   sum += static_cast<acc_t>(buffer[lane]);
+                                 }
+                                 vsumsq.store(buffer);
+                                 for (const auto lane : c10::irange(kWidth)) {
+                                   sumsq += static_cast<acc_t>(buffer[lane]);
+                                 }
+                               }
+                               for (; d < dim; ++d) {
+                                 auto value = x_row[d];
+                                 if (add_pre) {
+                                   value = value + residual_row[d];
+                                 }
+                                 const auto val_acc = static_cast<acc_t>(value);
+                                 sum += val_acc;
+                                 sumsq += val_acc * val_acc;
+                               }
+                             } else {
+                               for (const auto d : c10::irange(dim)) {
+                                 auto value = x_row[d];
+                                 if (add_pre) {
+                                   value = value + residual_row[d];
+                                 }
+                                 const auto val_acc = static_cast<acc_t>(value);
+                                 sum += val_acc;
+                                 sumsq += val_acc * val_acc;
+                               }
                              }
 
                              acc_t mean = static_cast<acc_t>(0);
@@ -117,25 +157,68 @@ at::Tensor fused_layer_norm_cpu(
                                    acc_t(1) / std::sqrt(variance + acc_t(eps));
                              }
 
-                             for (const auto d : c10::irange(dim)) {
-                               auto value = x_row[d];
-                               if (prenorm && residual_row != nullptr) {
-                                 value = value + residual_row[d];
+                             if constexpr (!c10::is_complex<scalar_t>::value) {
+                               using Vec = at::vec::Vectorized<scalar_t>;
+                               constexpr auto kWidth = Vec::size();
+                               int64_t d = 0;
+                               const auto mean_scalar = static_cast<scalar_t>(mean);
+                               const auto inv_scalar =
+                                   static_cast<scalar_t>(inv_var);
+                               const Vec vec_mean(mean_scalar);
+                               const Vec vec_inv(inv_scalar);
+                               for (; d + kWidth <= dim; d += kWidth) {
+                                 auto vx = Vec::loadu(x_row + d);
+                                 if (add_pre) {
+                                   vx = vx + Vec::loadu(residual_row + d);
+                                 }
+                                 if (!is_rms) {
+                                   vx = vx - vec_mean;
+                                 }
+                                 vx = vx * vec_inv;
+                                 vx = vx * Vec::loadu(weight_ptr + d);
+                                 if (has_bias) {
+                                   vx = vx + Vec::loadu(bias_ptr + d);
+                                 }
+                                 if (add_post) {
+                                   vx = vx + Vec::loadu(residual_row + d);
+                                 }
+                                 vx.store(out_row + d);
                                }
-                               auto normed = is_rms
-                                                 ? value * static_cast<scalar_t>(inv_var)
-                                                 : (value - static_cast<scalar_t>(mean)) *
-                                                       static_cast<scalar_t>(inv_var);
-                               normed *= weight_ptr[d];
-                               if (bias_ptr != nullptr) {
-                                 normed += bias_ptr[d];
+                               for (; d < dim; ++d) {
+                                 auto value = x_row[d];
+                                 if (add_pre) {
+                                   value = value + residual_row[d];
+                                 }
+                                 auto normed = is_rms
+                                                   ? value * inv_scalar
+                                                   : (value - mean_scalar) * inv_scalar;
+                                 normed *= weight_ptr[d];
+                                 if (has_bias) {
+                                   normed += bias_ptr[d];
+                                 }
+                                 if (add_post) {
+                                   normed += residual_row[d];
+                                 }
+                                 out_row[d] = normed;
                                }
-                               out_row[d] = normed;
-                             }
-
-                             if (!prenorm && residual_row != nullptr) {
+                             } else {
                                for (const auto d : c10::irange(dim)) {
-                                 out_row[d] += residual_row[d];
+                                 auto value = x_row[d];
+                                 if (add_pre) {
+                                   value = value + residual_row[d];
+                                 }
+                                 auto normed = is_rms
+                                                   ? value * static_cast<scalar_t>(inv_var)
+                                                   : (value - static_cast<scalar_t>(mean)) *
+                                                         static_cast<scalar_t>(inv_var);
+                                 normed *= weight_ptr[d];
+                                 if (has_bias) {
+                                   normed += bias_ptr[d];
+                                 }
+                                 if (add_post) {
+                                   normed += residual_row[d];
+                                 }
+                                 out_row[d] = normed;
                                }
                              }
                            }
