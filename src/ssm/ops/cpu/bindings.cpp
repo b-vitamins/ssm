@@ -66,6 +66,12 @@ at::Tensor dw_causal_conv_cpu(const at::Tensor& x, const at::Tensor& weight,
                               const c10::optional<at::Tensor>& bias,
                               const std::string& activation);
 
+std::tuple<at::Tensor, at::Tensor, c10::optional<at::Tensor>>
+dw_causal_conv_backward_cpu(const at::Tensor& grad_output,
+                            const at::Tensor& x, const at::Tensor& weight,
+                            const c10::optional<at::Tensor>& bias,
+                            const std::string& activation);
+
 at::Tensor fused_layer_norm_cpu(
     const at::Tensor& x, const at::Tensor& weight,
     const c10::optional<at::Tensor>& bias,
@@ -117,6 +123,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("dw_causal_conv", &ssm::cpu::dw_causal_conv_cpu,
         "Depthwise causal conv (CPU)", py::arg("x"), py::arg("weight"),
         py::arg("bias") = c10::nullopt, py::arg("activation") = "silu");
+  m.def("dw_causal_conv_backward", &ssm::cpu::dw_causal_conv_backward_cpu,
+        "Depthwise causal conv backward (CPU)", py::arg("grad_output"),
+        py::arg("x"), py::arg("weight"), py::arg("bias") = c10::nullopt,
+        py::arg("activation") = "silu");
   m.def("fused_layer_norm", &ssm::cpu::fused_layer_norm_cpu,
         "Fused LayerNorm/RMSNorm (CPU)", py::arg("x"), py::arg("weight"),
         py::arg("bias") = c10::nullopt, py::arg("residual") = c10::nullopt,
@@ -148,6 +158,13 @@ TORCH_LIBRARY(ssm, m) {
       " Tensor B, Tensor C, int chunk_size, Tensor? D=None, Tensor? z=None,"
       " Tensor? seq_lens=None, Tensor? cu_seqlens=None, Tensor? initial_states=None)"
       " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor?, Tensor?, Tensor?)");
+  m.def(
+      "dw_causal_conv(Tensor x, Tensor weight, Tensor? bias=None,"
+      " str activation='silu') -> Tensor");
+  m.def(
+      "dw_causal_conv_backward(Tensor grad_output, Tensor x, Tensor weight,"
+      " Tensor? bias=None, str activation='silu')"
+      " -> (Tensor, Tensor, Tensor?)");
 }
 
 TORCH_LIBRARY_IMPL(ssm, CPU, m) {
@@ -158,5 +175,7 @@ TORCH_LIBRARY_IMPL(ssm, CPU, m) {
           ssm::cpu::selective_state_step_backward_cpu);
   m.impl("ssd_chunk_scan", ssm::cpu::ssd_chunk_scan_cpu);
   m.impl("ssd_chunk_scan_backward", ssm::cpu::ssd_chunk_scan_backward_cpu);
+  m.impl("dw_causal_conv", ssm::cpu::dw_causal_conv_cpu);
+  m.impl("dw_causal_conv_backward", ssm::cpu::dw_causal_conv_backward_cpu);
 }
 
