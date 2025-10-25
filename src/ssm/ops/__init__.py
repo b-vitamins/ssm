@@ -257,75 +257,38 @@ class _SelectiveScanFunction(torch.autograd.Function):
         softplus: bool = ctx.softplus
         req = ctx.input_requires_grad
 
-        with torch.enable_grad():
-            u_ref = u.detach().clone().requires_grad_(req[0])
-            delta_ref = delta.detach().clone().requires_grad_(req[1])
-            A_ref = A.detach().clone().requires_grad_(req[2])
-            B_ref = B.detach().clone().requires_grad_(req[3])
-            C_ref = C.detach().clone().requires_grad_(req[4])
-            D_ref = D.detach().clone().requires_grad_(req[5]) if D is not None else None
-            z_ref = z.detach().clone().requires_grad_(req[6]) if z is not None else None
-            dt_bias_ref = (
-                dt_bias.detach().clone().requires_grad_(req[7])
-                if dt_bias is not None
-                else None
-            )
+        ops = _load_cpu_ops()
+        assert ops is not None
 
-            out_ref, last_state_ref = reference_ops.selective_scan(
-                u_ref,
-                delta_ref,
-                A_ref,
-                B_ref,
-                C_ref,
-                D=D_ref,
-                z=z_ref,
-                dt_bias=dt_bias_ref,
-                softplus=softplus,
-                return_last_state=True,
-            )
+        grad_out_tensor = (
+            grad_output.contiguous() if grad_output is not None else torch.zeros_like(u)
+        )
+        grad_last_tensor = (
+            grad_last_state.contiguous() if grad_last_state is not None else None
+        )
 
-            grad_out = (
-                grad_output if grad_output is not None else torch.zeros_like(out_ref)
-            )
-            grad_last = (
-                grad_last_state
-                if grad_last_state is not None
-                else torch.zeros_like(last_state_ref)
-            )
+        grads = ops.selective_scan_backward(
+            grad_out_tensor,
+            grad_last_tensor,
+            u,
+            delta,
+            A,
+            B,
+            C,
+            D,
+            z,
+            dt_bias,
+            softplus,
+        )
 
-            inputs: list[torch.Tensor] = []
-            mapping: list[int] = []
-            candidates = [
-                u_ref,
-                delta_ref,
-                A_ref,
-                B_ref,
-                C_ref,
-                D_ref,
-                z_ref,
-                dt_bias_ref,
-            ]
-            for idx, tensor in enumerate(candidates):
-                if tensor is not None and tensor.requires_grad:
-                    inputs.append(tensor)
-                    mapping.append(idx)
-
-            grads: tuple[torch.Tensor, ...]
-            if inputs:
-                grads = torch.autograd.grad(
-                    outputs=(out_ref, last_state_ref),
-                    inputs=inputs,
-                    grad_outputs=(grad_out, grad_last),
-                    allow_unused=True,
-                )
+        grad_tensors: list[Optional[torch.Tensor]] = []
+        for flag, grad in zip(req, grads):
+            if not flag or grad is None:
+                grad_tensors.append(None)
             else:
-                grads = tuple()
+                grad_tensors.append(grad)
 
-        result: list[Optional[torch.Tensor]] = [None] * 8
-        for idx, grad in zip(mapping, grads):
-            result[idx] = grad
-
-        return (None, *result, None)
+        return (None, *grad_tensors, None)
 
 
 class _SelectiveScanCudaFunction(torch.autograd.Function):
