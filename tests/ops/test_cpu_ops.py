@@ -408,11 +408,11 @@ def test_ssd_chunk_scan_cpu_varlen_and_grouped() -> None:
 
 
 @pytest.mark.parametrize(
-    "is_rms,prenorm,residual_in_fp32",
-    list(itertools.product([True, False], repeat=3)),
+    "is_rms,prenorm,residual_in_fp32,use_residual",
+    list(itertools.product([True, False], repeat=4)),
 )
 def test_fused_layer_norm_cpu_matches_reference(
-    is_rms: bool, prenorm: bool, residual_in_fp32: bool
+    is_rms: bool, prenorm: bool, residual_in_fp32: bool, use_residual: bool
 ) -> None:
     _require_cpu_backend()
     torch.manual_seed(6)
@@ -420,7 +420,7 @@ def test_fused_layer_norm_cpu_matches_reference(
     x = torch.randn(batch, seqlen, dim)
     weight = torch.randn(dim)
     bias = torch.randn(dim)
-    residual = torch.randn(batch, seqlen, dim)
+    residual = torch.randn(batch, seqlen, dim) if use_residual else None
 
     ref_out = reference_ops.fused_layer_norm(
         x,
