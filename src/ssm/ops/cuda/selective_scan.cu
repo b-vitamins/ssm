@@ -68,17 +68,33 @@ PreparedScanParam prepare_scan_param(const std::string& name,
     return info;
   }
   if (param.dim() == 3) {
-    TORCH_CHECK(param.size(0) == batch && param.size(1) == dim &&
-                    param.size(2) == state_dim,
+    TORCH_CHECK(param.size(0) == batch && param.size(2) == state_dim,
                 name, " must have shape (B, D, N) when 3-D.");
     auto target_dtype = expect_variable_dtype ? dtype : param.scalar_type();
-    info.tensor = param.to(device, target_dtype).contiguous();
-    info.kind = ScanParamKind::kPerBatch;
-    info.groups = info.tensor.size(1);
+    auto tensor = param.to(device, target_dtype).contiguous();
+    TORCH_CHECK(tensor.size(1) == dim,
+                name,
+                " second dimension must match number of channels when 3-D.");
+    info.groups = tensor.size(1);
     info.dim_per_group = dim / info.groups;
-    info.stride_batch = info.tensor.stride(0);
-    info.stride_dim = info.tensor.stride(1);
-    info.stride_state = info.tensor.stride(2);
+    if (expect_variable_dtype) {
+      info.kind = ScanParamKind::kGroupedTime;
+      info.time_size = length;
+      info.tensor =
+          tensor.view({batch, info.groups, state_dim, 1})
+              .expand({batch, info.groups, state_dim, length})
+              .contiguous();
+      info.stride_batch = info.tensor.stride(0);
+      info.stride_group = info.tensor.stride(1);
+      info.stride_state = info.tensor.stride(2);
+      info.stride_time = info.tensor.stride(3);
+    } else {
+      info.tensor = tensor;
+      info.kind = ScanParamKind::kPerBatch;
+      info.stride_batch = info.tensor.stride(0);
+      info.stride_dim = info.tensor.stride(1);
+      info.stride_state = info.tensor.stride(2);
+    }
     return info;
   }
   if (param.dim() == 4) {
