@@ -497,6 +497,99 @@ def test_selective_state_step_cuda_backward_matches_reference() -> None:
         torch.testing.assert_close(grad_cuda, grad_ref, atol=1e-4, rtol=1e-4)
 
 
+def test_selective_state_step_cuda_grouped_gradients_match_reference() -> None:
+    torch.manual_seed(4)
+    device = torch.device("cuda")
+    batch, dim, state_dim, groups = 2, 4, 3, 2
+
+    base_state = torch.randn(
+        batch, dim, state_dim, device=device, dtype=torch.float32, requires_grad=True
+    )
+    x = torch.randn(batch, dim, device=device, dtype=torch.float32, requires_grad=True)
+    dt = torch.randn(batch, dim, device=device, dtype=torch.float32, requires_grad=True)
+    A = torch.randn(
+        dim, state_dim, device=device, dtype=torch.float32, requires_grad=True
+    )
+    B = torch.randn(
+        batch, groups, state_dim, device=device, dtype=torch.float32, requires_grad=True
+    )
+    C = torch.randn(
+        batch, groups, state_dim, device=device, dtype=torch.float32, requires_grad=True
+    )
+    D = torch.randn(dim, device=device, dtype=torch.float32, requires_grad=True)
+    z = torch.randn(batch, dim, device=device, dtype=torch.float32, requires_grad=True)
+    dt_bias = torch.randn(dim, device=device, dtype=torch.float32, requires_grad=True)
+
+    ref_inputs = [
+        base_state.detach().clone().requires_grad_(True),
+        x.detach().clone().requires_grad_(True),
+        dt.detach().clone().requires_grad_(True),
+        A.detach().clone().requires_grad_(True),
+        B.detach().clone().requires_grad_(True),
+        C.detach().clone().requires_grad_(True),
+        D.detach().clone().requires_grad_(True),
+        z.detach().clone().requires_grad_(True),
+        dt_bias.detach().clone().requires_grad_(True),
+    ]
+
+    ref_out = reference_ops.selective_state_step(
+        ref_inputs[0],
+        ref_inputs[1],
+        ref_inputs[2],
+        ref_inputs[3],
+        ref_inputs[4],
+        ref_inputs[5],
+        D=ref_inputs[6],
+        z=ref_inputs[7],
+        dt_bias=ref_inputs[8],
+        softplus=True,
+    )
+    ref_out.sum().backward()
+    ref_grads = [_clone_grad(tensor) for tensor in ref_inputs]
+
+    state_cuda = base_state.detach().clone().requires_grad_(True)
+    x_cuda = x.detach().clone().requires_grad_(True)
+    dt_cuda = dt.detach().clone().requires_grad_(True)
+    A_cuda = A.detach().clone().requires_grad_(True)
+    B_cuda = B.detach().clone().requires_grad_(True)
+    C_cuda = C.detach().clone().requires_grad_(True)
+    D_cuda = D.detach().clone().requires_grad_(True)
+    z_cuda = z.detach().clone().requires_grad_(True)
+    dt_bias_cuda = dt_bias.detach().clone().requires_grad_(True)
+
+    out_cuda = cast(
+        torch.Tensor,
+        ops.selective_state_step(
+            state_cuda,
+            x_cuda,
+            dt_cuda,
+            A_cuda,
+            B_cuda,
+            C_cuda,
+            D=D_cuda,
+            z=z_cuda,
+            dt_bias=dt_bias_cuda,
+            softplus=True,
+        ),
+    )
+    out_cuda.sum().backward()
+
+    cuda_grads = [
+        _clone_grad(state_cuda),
+        _clone_grad(x_cuda),
+        _clone_grad(dt_cuda),
+        _clone_grad(A_cuda),
+        _clone_grad(B_cuda),
+        _clone_grad(C_cuda),
+        _clone_grad(D_cuda),
+        _clone_grad(z_cuda),
+        _clone_grad(dt_bias_cuda),
+    ]
+
+    for grad_cuda, grad_ref in zip(cuda_grads, ref_grads):
+        torch.testing.assert_close(grad_cuda, grad_ref, atol=1e-4, rtol=1e-4)
+
+
 def test_dw_causal_conv_cuda_gradients_match_reference() -> None:
     torch.manual_seed(4)
     device = torch.device("cuda")

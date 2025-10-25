@@ -1595,9 +1595,10 @@ def selective_state_step(
                 )
                 state.copy_(new_state)
                 return output
-            return _invoke_cuda(
+            state_work = state.clone()
+            output = _invoke_cuda(
                 ops.selective_state_step,
-                state.clone(),
+                state_work,
                 x if x.is_contiguous() else x.contiguous(),
                 dt if dt.is_contiguous() else dt.contiguous(),
                 A,
@@ -1610,6 +1611,8 @@ def selective_state_step(
                 else dt_bias.contiguous(),
                 softplus,
             )
+            state.copy_(state_work)
+            return output
     if _should_use_cpu(state, x, dt, A, B, C, D, z, dt_bias):
         ops = _load_cpu_ops()
         if ops is not None:
