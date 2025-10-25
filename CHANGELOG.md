@@ -31,6 +31,10 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - CUDA kernels and bindings for selective scan, selective state step, SSD chunk scan, depthwise causal convolution, and fused layer norm with GPU-dispatch integration and CUDA-focused tests.
 - Stress tests that cover long sequences, high state dimensions, grouped parameters, and mixed-precision execution paths under `tests/stress/`.
 ### Changed
+- Replaced the CUDA depthwise causal convolution with a shared-memory kernel
+  matching the upstream tiling strategy, aligned activation handling with the
+  reference path, and expanded GPU tests to cover multiple kernel sizes and
+  activations.
 - Rebuilt the CUDA SSD chunk scan to launch chunk-level fused kernels with
   shared-memory staging, vectorized gating, and ragged sequence support aligned
   with the upstream implementation.

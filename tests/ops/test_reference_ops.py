@@ -160,7 +160,7 @@ def test_dw_causal_conv_layout_and_grad(layout):
     weight = torch.randn(C, kernel, dtype=torch.float32)
     bias = torch.randn(C, dtype=torch.float32)
 
-    out = dw_causal_conv(x, weight, bias=bias, activation="relu")
+    out = dw_causal_conv(x, weight, bias=bias, activation="silu")
     assert out.shape == x.shape
 
     out.sum().backward()
