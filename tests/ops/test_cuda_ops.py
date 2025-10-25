@@ -234,6 +234,83 @@ def test_selective_scan_cuda_gradients_grouped_match_reference() -> None:
         torch.testing.assert_close(grad_cuda, grad_ref, atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("is_rms", [False, True])
+@pytest.mark.parametrize("prenorm", [True, False])
+@pytest.mark.parametrize("residual_in_fp32", [False, True])
+def test_fused_layer_norm_cuda_matches_reference(
+    dtype: torch.dtype, is_rms: bool, prenorm: bool, residual_in_fp32: bool
+) -> None:
+    torch.manual_seed(4)
+    device = torch.device("cuda")
+    batch, length, dim = 3, 5, 321
+
+    x = torch.randn(batch, length, dim, device=device, dtype=dtype)
+    weight = torch.randn(dim, device=device, dtype=torch.float32)
+    bias = torch.randn(dim, device=device, dtype=torch.float32)
+
+    residual_dtype = torch.float32 if residual_in_fp32 else dtype
+    residual = torch.randn(batch, length, dim, device=device, dtype=residual_dtype)
+
+    out = ops.fused_layer_norm(
+        x,
+        weight,
+        bias,
+        residual=residual,
+        is_rms=is_rms,
+        eps=1e-5,
+        prenorm=prenorm,
+        residual_in_fp32=residual_in_fp32,
+    )
+    ref = reference_ops.fused_layer_norm(
+        x,
+        weight,
+        bias,
+        residual=residual,
+        is_rms=is_rms,
+        eps=1e-5,
+        prenorm=prenorm,
+        residual_in_fp32=residual_in_fp32,
+    )
+
+    atol = 1e-5 if dtype == torch.float32 else 1e-3
+    rtol = 1e-5 if dtype == torch.float32 else 1e-3
+    torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("is_rms", [False, True])
+def test_fused_layer_norm_cuda_without_residual(is_rms: bool) -> None:
+    torch.manual_seed(5)
+    device = torch.device("cuda")
+    batch, length, dim = 2, 7, 128
+
+    x = torch.randn(batch, length, dim, device=device, dtype=torch.float16)
+    weight = torch.randn(dim, device=device, dtype=torch.float32)
+
+    out = ops.fused_layer_norm(
+        x,
+        weight,
+        None,
+        residual=None,
+        is_rms=is_rms,
+        eps=1e-5,
+        prenorm=True,
+        residual_in_fp32=True,
+    )
+    ref = reference_ops.fused_layer_norm(
+        x,
+        weight,
+        None,
+        residual=None,
+        is_rms=is_rms,
+        eps=1e-5,
+        prenorm=True,
+        residual_in_fp32=True,
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+
+
 def test_ssd_chunk_scan_cuda_respects_varlen() -> None:
     torch.manual_seed(1)
     device = torch.device("cuda")
