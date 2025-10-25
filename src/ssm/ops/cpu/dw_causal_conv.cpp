@@ -3,7 +3,6 @@
 #include <ATen/ATen.h>
 #include <ATen/ops/constant_pad_nd.h>
 #include <ATen/ops/conv1d.h>
-#include <ATen/ops/relu.h>
 #include <ATen/ops/silu.h>
 
 #include <algorithm>
@@ -67,7 +66,8 @@ at::Tensor dw_causal_conv_cpu(const at::Tensor& x, const at::Tensor& weight,
 
   auto act = activation;
   std::transform(act.begin(), act.end(), act.begin(), ::tolower);
-  TORCH_CHECK(act == "silu" || act == "relu" || act == "identity",
+  TORCH_CHECK(act == "silu" || act == "swish" || act == "identity" ||
+                  act == "none",
               "Unsupported activation '" + activation + "'.");
 
   const auto pad = std::max<int64_t>(kernel_size - 1, 0);
@@ -77,15 +77,11 @@ at::Tensor dw_causal_conv_cpu(const at::Tensor& x, const at::Tensor& weight,
   auto conv_out = at::conv1d(x_padded, weight_cast, bias_cast, {1}, {0}, {1},
                              channels);
 
-  if (act == "silu") {
+  if (act == "silu" || act == "swish") {
     if (conv_out.is_complex()) {
       conv_out = conv_out / ((-conv_out).exp() + 1);
     } else {
       conv_out = at::silu(conv_out);
-    }
-  } else if (act == "relu") {
-    if (!conv_out.is_complex()) {
-      conv_out = at::relu(conv_out);
     }
   }
 

@@ -673,26 +673,38 @@ def test_selective_state_step_cuda_grouped_gradients_match_reference() -> None:
         torch.testing.assert_close(grad_cuda, grad_ref, atol=1e-4, rtol=1e-4)
 
 
-def test_dw_causal_conv_cuda_gradients_match_reference() -> None:
+@pytest.mark.parametrize("channels_first", [True, False])
+@pytest.mark.parametrize("kernel_size", [2, 3, 4])
+@pytest.mark.parametrize("activation", ["identity", "silu", "swish"])
+def test_dw_causal_conv_cuda_gradients_match_reference(
+    channels_first: bool, kernel_size: int, activation: str
+) -> None:
     torch.manual_seed(4)
     device = torch.device("cuda")
-    batch, channels, length = 1, 3, 6
+    batch, channels, length = 2, 3, 9
 
-    x = torch.randn(batch, channels, length, device=device, requires_grad=True)
-    weight = torch.randn(channels, 1, 3, device=device, requires_grad=True)
+    base = torch.randn(batch, channels, length, device=device, requires_grad=True)
+    if channels_first:
+        x = base
+    else:
+        x = base.permute(0, 2, 1).contiguous()
+        x.requires_grad_(True)
+
+    weight = torch.randn(channels, kernel_size, device=device, requires_grad=True)
     bias = torch.randn(channels, device=device, requires_grad=True)
 
     ref_x = x.detach().clone().requires_grad_(True)
     ref_weight = weight.detach().clone().requires_grad_(True)
     ref_bias = bias.detach().clone().requires_grad_(True)
     ref_out = reference_ops.dw_causal_conv(
-        ref_x, ref_weight, bias=ref_bias, activation="silu"
+        ref_x, ref_weight, bias=ref_bias, activation=activation
     )
     ref_out.sum().backward()
     ref_grads = [_clone_grad(ref_x), _clone_grad(ref_weight), _clone_grad(ref_bias)]
 
     out = cast(
-        torch.Tensor, ops.dw_causal_conv(x, weight, bias=bias, activation="silu")
+        torch.Tensor,
+        ops.dw_causal_conv(x, weight, bias=bias, activation=activation),
     )
     out.sum().backward()
     cuda_grads = [_clone_grad(x), _clone_grad(weight), _clone_grad(bias)]

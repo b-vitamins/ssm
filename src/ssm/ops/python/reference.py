@@ -474,8 +474,8 @@ def dw_causal_conv(
     Args:
         x: Input with layout ``(B, C, L)`` or ``(B, L, C)``.
         weight: Depthwise kernel ``(C, K)`` or ``(C, 1, K)``.
-        bias: Optional bias ``(C,)``.
-        activation: Post-convolution activation (``"silu"``, ``"relu"``, ``"identity"``).
+    bias: Optional bias ``(C,)``.
+    activation: Post-convolution activation (``"silu"``, ``"swish"``, ``"identity"``, ``"none"``).
 
     Returns:
         Tensor matching the layout and dtype of ``x``.
@@ -525,11 +525,9 @@ def dw_causal_conv(
     out = F.conv1d(x_padded, weight_conv, bias=bias_conv, groups=channels)
 
     activation = activation.lower()
-    if activation == "silu":
+    if activation in ("silu", "swish"):
         out = F.silu(out)
-    elif activation == "relu":
-        out = F.relu(out)
-    elif activation == "identity":
+    elif activation in ("identity", "none"):
         pass
     else:
         raise ValueError(f"Unsupported activation '{activation}'.")

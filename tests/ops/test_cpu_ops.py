@@ -93,7 +93,7 @@ def test_dw_causal_conv_cpu_matches_reference() -> None:
 
     batch, channels, length = 2, 3, 11
     kernel_sizes = [1, 3, 5]
-    activations = ["identity", "relu", "silu"]
+    activations = ["identity", "none", "silu", "swish"]
     dtypes = [torch.float32, torch.float64, torch.bfloat16]
 
     for dtype in dtypes:
