@@ -141,6 +141,16 @@ def _time_fn(
     return times
 
 
+def _backend_order(device: torch.device) -> tuple[str, ...]:
+    order: list[str] = ["python"]
+    if device.type == "cpu":
+        order.append("cpu")
+    if device.type == "cuda":  # pragma: no branch - only cuda targets
+        order.append("cuda")
+    order.append("dispatch")
+    return tuple(order)
+
+
 def _with_grad_disabled(fn: Callable[[], None]) -> Callable[[], None]:
     def wrapper() -> None:
         with torch.no_grad():
@@ -368,7 +378,7 @@ def _build_selective_scan_runners(
             return run
         raise ValueError(f"unknown backend {backend}")
 
-    order = ("python", "cpu", "cuda", "dispatch")
+    order = _backend_order(device)
     for backend in order:
         samples, note = _benchmark_backend(backend, make_runner, device, iters=iters)
         if samples is not None:
@@ -502,7 +512,7 @@ def _build_state_step_runners(
             return run
         raise ValueError(f"unknown backend {backend}")
 
-    order = ("python", "cpu", "cuda", "dispatch")
+    order = _backend_order(device)
     for backend in order:
         samples, note = _benchmark_backend(backend, make_runner, device, iters=iters)
         if samples is not None:
@@ -638,7 +648,7 @@ def _build_chunk_scan_runners(
             return run
         raise ValueError(f"unknown backend {backend}")
 
-    order = ("python", "cpu", "cuda", "dispatch")
+    order = _backend_order(device)
     for backend in order:
         samples, note = _benchmark_backend(backend, make_runner, device, iters=iters)
         if samples is not None:
