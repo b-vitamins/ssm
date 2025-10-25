@@ -29,6 +29,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - CUDA kernels and bindings for selective scan, selective state step, SSD chunk scan, depthwise causal convolution, and fused layer norm with GPU-dispatch integration and CUDA-focused tests.
 - Stress tests that cover long sequences, high state dimensions, grouped parameters, and mixed-precision execution paths under `tests/stress/`.
 ### Changed
+- Replaced the CUDA selective scan path with the upstream parallel kernel,
+  adding grouped-parameter coverage and gradient consistency tests.
 - Optimized the CPU fused layer norm kernel with vectorized reductions and
   optional residual fusion paths aligned across RMSNorm and LayerNorm.
 - Optimized the CPU depthwise causal convolution to reuse PyTorch's grouped

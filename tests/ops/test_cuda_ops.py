@@ -154,6 +154,85 @@ def test_selective_scan_cuda_gradients_match_reference() -> None:
         torch.testing.assert_close(grad_cuda, grad_ref, atol=1e-4, rtol=1e-4)
 
 
+def test_selective_scan_cuda_gradients_grouped_match_reference() -> None:
+    torch.manual_seed(2)
+    device = torch.device("cuda")
+    batch, dim, state_dim, length, groups = 2, 4, 3, 5, 2
+
+    u = torch.randn(
+        batch, dim, length, device=device, dtype=torch.float32, requires_grad=True
+    )
+    delta = torch.randn_like(u, requires_grad=True)
+    A = torch.randn(
+        dim, state_dim, device=device, dtype=torch.float32, requires_grad=True
+    )
+    B = torch.randn(
+        batch,
+        groups,
+        state_dim,
+        length,
+        device=device,
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    C = torch.randn(
+        batch,
+        groups,
+        state_dim,
+        1,
+        device=device,
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    dt_bias = torch.randn(dim, device=device, dtype=torch.float32, requires_grad=True)
+
+    ref_inputs = [
+        u.detach().clone().requires_grad_(True),
+        delta.detach().clone().requires_grad_(True),
+        A.detach().clone().requires_grad_(True),
+        B.detach().clone().requires_grad_(True),
+        C.detach().clone().requires_grad_(True),
+        dt_bias.detach().clone().requires_grad_(True),
+    ]
+
+    ref_out = cast(
+        torch.Tensor,
+        reference_ops.selective_scan(
+            ref_inputs[0],
+            ref_inputs[1],
+            ref_inputs[2],
+            ref_inputs[3],
+            ref_inputs[4],
+            D=None,
+            z=None,
+            dt_bias=ref_inputs[5],
+            softplus=True,
+        ),
+    )
+    ref_out.sum().backward()
+    ref_grads = [_clone_grad(tensor) for tensor in ref_inputs]
+
+    out = cast(
+        torch.Tensor,
+        ops.selective_scan(
+            u,
+            delta,
+            A,
+            B,
+            C,
+            D=None,
+            z=None,
+            dt_bias=dt_bias,
+            softplus=True,
+        ),
+    )
+    out.sum().backward()
+    cuda_grads = [_clone_grad(tensor) for tensor in (u, delta, A, B, C, dt_bias)]
+
+    for grad_cuda, grad_ref in zip(cuda_grads, ref_grads):
+        torch.testing.assert_close(grad_cuda, grad_ref, atol=1e-4, rtol=1e-4)
+
+
 def test_ssd_chunk_scan_cuda_respects_varlen() -> None:
     torch.manual_seed(1)
     device = torch.device("cuda")
