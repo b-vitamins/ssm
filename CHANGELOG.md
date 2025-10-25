@@ -31,6 +31,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ### Changed
 - Replaced the CUDA selective scan path with the upstream parallel kernel,
   adding grouped-parameter coverage and gradient consistency tests.
+- Replaced the CUDA selective state step with a fused kernel mirroring the
+  upstream tiling strategy, fixing inference-time state updates and expanding
+  grouped/gated gradient coverage.
 - Optimized the CPU fused layer norm kernel with vectorized reductions and
   optional residual fusion paths aligned across RMSNorm and LayerNorm.
 - Optimized the CPU depthwise causal convolution to reuse PyTorch's grouped
