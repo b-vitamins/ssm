@@ -573,204 +573,208 @@ ssd_chunk_scan_backward_cpu(
           z_vector_proj_stride = z_input_tensor.stride(3);
         }
 
-        at::parallel_for(0, batch * heads, 0, [&](int64_t start, int64_t end) {
-          for (const auto idx : c10::irange(start, end)) {
-            const auto b = idx / heads;
-            const auto h = idx % heads;
-            const auto valid =
-                std::min<int64_t>(lengths_ptr[b], seqlen);
-            if (valid <= 0) {
-              continue;
-            }
+        at::parallel_for(0, heads, 0, [&](int64_t start, int64_t end) {
+          for (const auto h : c10::irange(start, end)) {
+            for (const auto b : c10::irange<int64_t>(batch)) {
+              const auto valid =
+                  std::min<int64_t>(lengths_ptr[b], seqlen);
+              if (valid <= 0) {
+                continue;
+              }
 
-            const auto token_base = b * batch_stride + h * proj_stride;
-            const auto dt_base = b * dt_batch_stride + h * dt_head_stride;
-            const auto grad_token_base = token_base;
-            const auto grad_dt_base = dt_base;
-            const auto init_offset = b * heads * head_stride + h * head_stride;
+              const auto token_base = b * batch_stride + h * proj_stride;
+              const auto dt_base = b * dt_batch_stride + h * dt_head_stride;
+              const auto grad_token_base = token_base;
+              const auto grad_dt_base = dt_base;
+              const auto init_offset =
+                  b * heads * head_stride + h * head_stride;
 
-            std::vector<scalar_t> state_hist((valid + 1) * proj,
-                                             scalar_t(0));
-            const auto* init_state_head = init_ptr + init_offset;
-            std::copy(init_state_head, init_state_head + proj,
-                      state_hist.data());
+              std::vector<scalar_t> state_hist((valid + 1) * proj,
+                                               scalar_t(0));
+              const auto* init_state_head = init_ptr + init_offset;
+              std::copy(init_state_head, init_state_head + proj,
+                        state_hist.data());
 
-            for (const auto t : c10::irange<int64_t>(valid)) {
-              const auto dt_offset = dt_base + t * dt_time_stride;
-              const auto dt_val = dt_ptr[dt_offset];
-              const auto* prev_state = state_hist.data() + t * proj;
-              auto* curr_state = state_hist.data() + (t + 1) * proj;
+              for (const auto t : c10::irange<int64_t>(valid)) {
+                const auto dt_offset = dt_base + t * dt_time_stride;
+                const auto dt_val = dt_ptr[dt_offset];
+                const auto* prev_state = state_hist.data() + t * proj;
+                auto* curr_state = state_hist.data() + (t + 1) * proj;
 
-              const auto B_slice =
-                  chunk_param_slice<scalar_t>(B_info, b, t, h);
-              const auto* B_head = B_slice.ptr;
-              const auto B_proj_stride = B_slice.stride;
+                const auto B_slice =
+                    chunk_param_slice<scalar_t>(B_info, b, t, h);
+                const auto* B_head = B_slice.ptr;
+                const auto B_proj_stride = B_slice.stride;
 
+                for (const auto p : c10::irange<int64_t>(proj)) {
+                  const auto decay =
+                      std::exp(dt_val * A_ptr[h * proj_stride + p]);
+                  const auto drive = B_head[p * B_proj_stride] *
+                                     X_ptr[token_base + t * token_stride + p];
+                  curr_state[p] = decay * prev_state[p] + dt_val * drive;
+                }
+              }
+
+              std::vector<scalar_t> grad_state_curr(proj, scalar_t(0));
+              std::vector<scalar_t> grad_state_prev(proj, scalar_t(0));
+
+              for (int64_t t = valid - 1; t >= 0; --t) {
+                std::fill(grad_state_prev.begin(), grad_state_prev.end(),
+                          scalar_t(0));
+
+                const auto dt_offset = grad_dt_base + t * dt_time_stride;
+                const auto dt_val = dt_ptr[dt_offset];
+                scalar_t grad_dt_val = scalar_t(0);
+
+                const auto token_offset = grad_token_base + t * token_stride;
+                const auto* X_token = X_ptr + token_offset;
+                auto* grad_X_token = grad_X_ptr + token_offset;
+                const auto* grad_out_token = grad_out_ptr + token_offset;
+
+                const auto B_slice =
+                    chunk_param_slice<scalar_t>(B_info, b, t, h);
+                const auto* B_head = B_slice.ptr;
+                const auto B_proj_stride = B_slice.stride;
+                auto B_grad_slice =
+                    chunk_param_slice<scalar_t>(B_grad_info, b, t, h);
+                auto* B_grad_head = const_cast<scalar_t*>(B_grad_slice.ptr);
+                const auto B_grad_stride = B_grad_slice.stride;
+
+                const auto C_slice =
+                    chunk_param_slice<scalar_t>(C_info, b, t, h);
+                const auto* C_head = C_slice.ptr;
+                const auto C_proj_stride = C_slice.stride;
+                auto C_grad_slice =
+                    chunk_param_slice<scalar_t>(C_grad_info, b, t, h);
+                auto* C_grad_head = const_cast<scalar_t*>(C_grad_slice.ptr);
+                const auto C_grad_stride = C_grad_slice.stride;
+
+                const auto* D_row = skip_has_matrix
+                                        ? D_ptr + h * proj_stride
+                                        : nullptr;
+                auto* grad_D_row = skip_has_matrix
+                                       ? grad_D_ptr + h * proj_stride
+                                       : nullptr;
+                const auto D_scalar =
+                    skip_has_vector ? D_ptr[h] : scalar_t(0);
+                auto* grad_D_scalar = skip_has_vector ? grad_D_ptr + h : nullptr;
+
+                scalar_t gate_scalar = scalar_t(1);
+                scalar_t gate_scalar_input = scalar_t(0);
+                scalar_t* grad_gate_scalar_ptr = nullptr;
+                if (gate_kind == GateKind::kScalar) {
+                  const auto offset = b * z_scalar_batch_stride +
+                                      t * z_scalar_time_stride +
+                                      h * z_scalar_head_stride;
+                  gate_scalar = z_gate_ptr[offset];
+                  gate_scalar_input = z_input_ptr[offset];
+                  grad_gate_scalar_ptr = grad_z_ptr + offset;
+                }
+
+                const scalar_t* gate_vector = nullptr;
+                const scalar_t* gate_vector_input = nullptr;
+                scalar_t* grad_gate_vector_ptr = nullptr;
+                if (gate_kind == GateKind::kVector) {
+                  const auto offset = b * z_vector_batch_stride +
+                                      t * z_vector_time_stride +
+                                      h * z_vector_head_stride;
+                  gate_vector = z_gate_ptr + offset;
+                  gate_vector_input = z_input_ptr + offset;
+                  grad_gate_vector_ptr = grad_z_ptr + offset;
+                }
+
+                const auto* prev_state = state_hist.data() + t * proj;
+                const auto* curr_state = state_hist.data() + (t + 1) * proj;
+
+                scalar_t grad_gate_scalar = scalar_t(0);
+
+                for (const auto p : c10::irange<int64_t>(proj)) {
+                  const auto A_val = A_ptr[h * proj_stride + p];
+                  const auto C_val = C_head[p * C_proj_stride];
+                  const auto updated = curr_state[p];
+                  scalar_t base = updated * C_val;
+                  if (skip_has_vector) {
+                    base += D_scalar * X_token[p];
+                  } else if (skip_has_matrix) {
+                    base += D_row[p] * X_token[p];
+                  }
+
+                  scalar_t gate_vec_val = scalar_t(1);
+                  scalar_t gate_vec_input_val = scalar_t(0);
+                  scalar_t* grad_gate_vec_slot = nullptr;
+                  if (gate_vector != nullptr) {
+                    gate_vec_val = gate_vector[p * z_vector_proj_stride];
+                    gate_vec_input_val =
+                        gate_vector_input[p * z_vector_proj_stride];
+                    grad_gate_vec_slot =
+                        grad_gate_vector_ptr + p * z_vector_proj_stride;
+                  }
+
+                  const auto pre_scalar = gate_vector != nullptr
+                                              ? base * gate_vec_val
+                                              : base;
+                  const auto grad_out_val = grad_out_token[p];
+                  grad_gate_scalar +=
+                      grad_out_val * conj_if_complex(pre_scalar);
+                  const auto grad_pre_scalar =
+                      grad_out_val * conj_if_complex(gate_scalar);
+
+                  scalar_t grad_base = grad_pre_scalar;
+                  if (gate_vector != nullptr) {
+                    const auto grad_gate_vec_val =
+                        grad_pre_scalar * conj_if_complex(base);
+                    grad_base = grad_pre_scalar * conj_if_complex(gate_vec_val);
+                    *grad_gate_vec_slot +=
+                        grad_gate_vec_val * silu_grad(gate_vec_input_val);
+                  }
+
+                  scalar_t state_grad = grad_state_curr[p] +
+                                        grad_base * conj_if_complex(C_val);
+                  C_grad_head[p * C_grad_stride] +=
+                      grad_base * conj_if_complex(updated);
+
+                  if (skip_has_vector) {
+                    grad_X_token[p] += grad_base * conj_if_complex(D_scalar);
+                    *grad_D_scalar += grad_base * conj_if_complex(X_token[p]);
+                  } else if (skip_has_matrix) {
+                    grad_X_token[p] += grad_base * conj_if_complex(D_row[p]);
+                    grad_D_row[p] += grad_base * conj_if_complex(X_token[p]);
+                  }
+
+                  const auto decay = std::exp(dt_val * A_val);
+                  const auto state_prev = prev_state[p];
+                  grad_state_prev[p] += state_grad * decay;
+
+                  const auto grad_decay =
+                      state_grad * conj_if_complex(state_prev);
+                  grad_A_ptr[h * proj_stride + p] +=
+                      grad_decay * (dt_val * decay);
+                  grad_dt_val += grad_decay * (A_val * decay);
+
+                  const auto B_val = B_head[p * B_proj_stride];
+                  const auto drive = B_val * X_token[p];
+                  B_grad_head[p * B_grad_stride] +=
+                      state_grad * conj_if_complex(dt_val * X_token[p]);
+                  grad_X_token[p] +=
+                      state_grad * conj_if_complex(dt_val * B_val);
+                  grad_dt_val += state_grad * conj_if_complex(drive);
+
+                  grad_state_curr[p] = state_grad;
+                }
+
+                grad_dt_ptr[dt_offset] += grad_dt_val;
+                if (grad_gate_scalar_ptr != nullptr) {
+                  *grad_gate_scalar_ptr +=
+                      grad_gate_scalar * silu_grad(gate_scalar_input);
+                }
+
+                grad_state_curr.swap(grad_state_prev);
+              }
+
+              auto* grad_init_head = grad_init_ptr + init_offset;
               for (const auto p : c10::irange<int64_t>(proj)) {
-                const auto decay = std::exp(dt_val * A_ptr[h * proj_stride + p]);
-                const auto drive = B_head[p * B_proj_stride] *
-                                   X_ptr[token_base + t * token_stride + p];
-                curr_state[p] = decay * prev_state[p] + dt_val * drive;
+                grad_init_head[p] = grad_state_curr[p];
               }
-            }
-
-            std::vector<scalar_t> grad_state_curr(proj, scalar_t(0));
-            std::vector<scalar_t> grad_state_prev(proj, scalar_t(0));
-
-            for (int64_t t = valid - 1; t >= 0; --t) {
-              std::fill(grad_state_prev.begin(), grad_state_prev.end(),
-                        scalar_t(0));
-
-              const auto dt_offset = grad_dt_base + t * dt_time_stride;
-              const auto dt_val = dt_ptr[dt_offset];
-              scalar_t grad_dt_val = scalar_t(0);
-
-              const auto token_offset = grad_token_base + t * token_stride;
-              const auto* X_token = X_ptr + token_offset;
-              auto* grad_X_token = grad_X_ptr + token_offset;
-              const auto* grad_out_token = grad_out_ptr + token_offset;
-
-              const auto B_slice =
-                  chunk_param_slice<scalar_t>(B_info, b, t, h);
-              const auto* B_head = B_slice.ptr;
-              const auto B_proj_stride = B_slice.stride;
-              auto B_grad_slice =
-                  chunk_param_slice<scalar_t>(B_grad_info, b, t, h);
-              auto* B_grad_head = const_cast<scalar_t*>(B_grad_slice.ptr);
-              const auto B_grad_stride = B_grad_slice.stride;
-
-              const auto C_slice =
-                  chunk_param_slice<scalar_t>(C_info, b, t, h);
-              const auto* C_head = C_slice.ptr;
-              const auto C_proj_stride = C_slice.stride;
-              auto C_grad_slice =
-                  chunk_param_slice<scalar_t>(C_grad_info, b, t, h);
-              auto* C_grad_head = const_cast<scalar_t*>(C_grad_slice.ptr);
-              const auto C_grad_stride = C_grad_slice.stride;
-
-              const auto* D_row = skip_has_matrix
-                                      ? D_ptr + h * proj_stride
-                                      : nullptr;
-              auto* grad_D_row = skip_has_matrix
-                                     ? grad_D_ptr + h * proj_stride
-                                     : nullptr;
-              const auto D_scalar =
-                  skip_has_vector ? D_ptr[h] : scalar_t(0);
-              auto* grad_D_scalar = skip_has_vector ? grad_D_ptr + h : nullptr;
-
-              scalar_t gate_scalar = scalar_t(1);
-              scalar_t gate_scalar_input = scalar_t(0);
-              scalar_t* grad_gate_scalar_ptr = nullptr;
-              if (gate_kind == GateKind::kScalar) {
-                const auto offset = b * z_scalar_batch_stride +
-                                    t * z_scalar_time_stride +
-                                    h * z_scalar_head_stride;
-                gate_scalar = z_gate_ptr[offset];
-                gate_scalar_input = z_input_ptr[offset];
-                grad_gate_scalar_ptr = grad_z_ptr + offset;
-              }
-
-              const scalar_t* gate_vector = nullptr;
-              const scalar_t* gate_vector_input = nullptr;
-              scalar_t* grad_gate_vector_ptr = nullptr;
-              if (gate_kind == GateKind::kVector) {
-                const auto offset = b * z_vector_batch_stride +
-                                    t * z_vector_time_stride +
-                                    h * z_vector_head_stride;
-                gate_vector = z_gate_ptr + offset;
-                gate_vector_input = z_input_ptr + offset;
-                grad_gate_vector_ptr = grad_z_ptr + offset;
-              }
-
-              const auto* prev_state = state_hist.data() + t * proj;
-              const auto* curr_state = state_hist.data() + (t + 1) * proj;
-
-              scalar_t grad_gate_scalar = scalar_t(0);
-
-              for (const auto p : c10::irange<int64_t>(proj)) {
-                const auto A_val = A_ptr[h * proj_stride + p];
-                const auto C_val = C_head[p * C_proj_stride];
-                const auto updated = curr_state[p];
-                scalar_t base = updated * C_val;
-                if (skip_has_vector) {
-                  base += D_scalar * X_token[p];
-                } else if (skip_has_matrix) {
-                  base += D_row[p] * X_token[p];
-                }
-
-                scalar_t gate_vec_val = scalar_t(1);
-                scalar_t gate_vec_input_val = scalar_t(0);
-                scalar_t* grad_gate_vec_slot = nullptr;
-                if (gate_vector != nullptr) {
-                  gate_vec_val = gate_vector[p * z_vector_proj_stride];
-                  gate_vec_input_val =
-                      gate_vector_input[p * z_vector_proj_stride];
-                  grad_gate_vec_slot =
-                      grad_gate_vector_ptr + p * z_vector_proj_stride;
-                }
-
-                const auto pre_scalar = gate_vector != nullptr
-                                            ? base * gate_vec_val
-                                            : base;
-                const auto grad_out_val = grad_out_token[p];
-                grad_gate_scalar +=
-                    grad_out_val * conj_if_complex(pre_scalar);
-                const auto grad_pre_scalar =
-                    grad_out_val * conj_if_complex(gate_scalar);
-
-                scalar_t grad_base = grad_pre_scalar;
-                if (gate_vector != nullptr) {
-                  const auto grad_gate_vec_val =
-                      grad_pre_scalar * conj_if_complex(base);
-                  grad_base = grad_pre_scalar * conj_if_complex(gate_vec_val);
-                  *grad_gate_vec_slot +=
-                      grad_gate_vec_val * silu_grad(gate_vec_input_val);
-                }
-
-                scalar_t state_grad = grad_state_curr[p] +
-                                      grad_base * conj_if_complex(C_val);
-                C_grad_head[p * C_grad_stride] +=
-                    grad_base * conj_if_complex(updated);
-
-                if (skip_has_vector) {
-                  grad_X_token[p] += grad_base * conj_if_complex(D_scalar);
-                  *grad_D_scalar += grad_base * conj_if_complex(X_token[p]);
-                } else if (skip_has_matrix) {
-                  grad_X_token[p] += grad_base * conj_if_complex(D_row[p]);
-                  grad_D_row[p] += grad_base * conj_if_complex(X_token[p]);
-                }
-
-                const auto decay = std::exp(dt_val * A_val);
-                const auto state_prev = prev_state[p];
-                grad_state_prev[p] += state_grad * decay;
-
-                const auto grad_decay = state_grad * conj_if_complex(state_prev);
-                grad_A_ptr[h * proj_stride + p] +=
-                    grad_decay * (dt_val * decay);
-                grad_dt_val += grad_decay * (A_val * decay);
-
-                const auto B_val = B_head[p * B_proj_stride];
-                const auto drive = B_val * X_token[p];
-                B_grad_head[p * B_grad_stride] +=
-                    state_grad * conj_if_complex(dt_val * X_token[p]);
-                grad_X_token[p] += state_grad * conj_if_complex(dt_val * B_val);
-                grad_dt_val += state_grad * conj_if_complex(drive);
-
-                grad_state_curr[p] = state_grad;
-              }
-
-              grad_dt_ptr[dt_offset] += grad_dt_val;
-              if (grad_gate_scalar_ptr != nullptr) {
-                *grad_gate_scalar_ptr +=
-                    grad_gate_scalar * silu_grad(gate_scalar_input);
-              }
-
-              grad_state_curr.swap(grad_state_prev);
-            }
-
-            auto* grad_init_head = grad_init_ptr + init_offset;
-            for (const auto p : c10::irange<int64_t>(proj)) {
-              grad_init_head[p] = grad_state_curr[p];
             }
           }
         });
