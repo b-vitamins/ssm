@@ -260,8 +260,13 @@ at::Tensor fused_layer_norm_cuda(
 
         at::Tensor residual_compute = residual_contig;
         if (residual_in_fp32) {
-          TORCH_CHECK(residual_compute.scalar_type() == at::kFloat,
-                      "residual must be float32 when residual_in_fp32 is true.");
+          if (residual_compute.scalar_type() != at::kFloat) {
+            residual_compute = residual_compute.to(
+                residual_compute.options().dtype(at::kFloat));
+          }
+          if (!residual_compute.is_contiguous()) {
+            residual_compute = residual_compute.contiguous();
+          }
           launch_layer_norm_kernel<scalar_t_, float, opmath_t>(
               x_contig.data_ptr<scalar_t_>(),
               residual_compute.data_ptr<float>(), weight_ptr, bias_ptr,
@@ -269,7 +274,11 @@ at::Tensor fused_layer_norm_cuda(
               true, prenorm, is_rms, has_bias, stream);
         } else {
           if (residual_compute.scalar_type() != x_contig.scalar_type()) {
-            residual_compute = residual_compute.to(x_contig.scalar_type());
+            residual_compute =
+                residual_compute.to(x_contig.scalar_type());
+          }
+          if (!residual_compute.is_contiguous()) {
+            residual_compute = residual_compute.contiguous();
           }
           launch_layer_norm_kernel<scalar_t_, scalar_t_, opmath_t>(
               x_contig.data_ptr<scalar_t_>(),
