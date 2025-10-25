@@ -31,6 +31,17 @@ at::Tensor selective_state_step_cpu(
     const c10::optional<at::Tensor>& D, const c10::optional<at::Tensor>& z,
     const c10::optional<at::Tensor>& dt_bias, bool softplus);
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, c10::optional<at::Tensor>, c10::optional<at::Tensor>,
+           c10::optional<at::Tensor>>
+selective_state_step_backward_cpu(
+    const at::Tensor& grad_output,
+    const c10::optional<at::Tensor>& grad_state, const at::Tensor& state,
+    const at::Tensor& x, const at::Tensor& dt, const at::Tensor& A,
+    const at::Tensor& B, const at::Tensor& C,
+    const c10::optional<at::Tensor>& D, const c10::optional<at::Tensor>& z,
+    const c10::optional<at::Tensor>& dt_bias, bool softplus);
+
 at::Tensor ssd_chunk_scan_cpu(
     const at::Tensor& X, const at::Tensor& dt, const at::Tensor& A,
     const at::Tensor& B, const at::Tensor& C, int64_t chunk_size,
@@ -70,6 +81,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("dt"), py::arg("A"), py::arg("B"), py::arg("C"),
         py::arg("D") = c10::nullopt, py::arg("z") = c10::nullopt,
         py::arg("dt_bias") = c10::nullopt, py::arg("softplus") = true);
+  m.def("selective_state_step_backward",
+        &ssm::cpu::selective_state_step_backward_cpu,
+        "Selective state step backward (CPU)", py::arg("grad_output"),
+        py::arg("grad_state") = c10::nullopt, py::arg("state"),
+        py::arg("x"), py::arg("dt"), py::arg("A"), py::arg("B"),
+        py::arg("C"), py::arg("D") = c10::nullopt, py::arg("z") = c10::nullopt,
+        py::arg("dt_bias") = c10::nullopt, py::arg("softplus") = true);
   m.def("ssd_chunk_scan", &ssm::cpu::ssd_chunk_scan_cpu,
         "SSD chunk scan (CPU)", py::arg("X"), py::arg("dt"), py::arg("A"),
         py::arg("B"), py::arg("C"), py::arg("chunk_size"),
@@ -97,10 +115,22 @@ TORCH_LIBRARY(ssm, m) {
       " Tensor u, Tensor delta, Tensor A, Tensor B, Tensor C, Tensor? D=None,"
       " Tensor? z=None, Tensor? dt_bias=None, bool softplus=False)"
       " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor?, Tensor?, Tensor?)");
+  m.def("selective_state_step(Tensor state, Tensor x, Tensor dt, Tensor A,"
+        " Tensor B, Tensor C, Tensor? D=None, Tensor? z=None,"
+        " Tensor? dt_bias=None, bool softplus=True)"
+        " -> (Tensor, Tensor)");
+  m.def(
+      "selective_state_step_backward(Tensor grad_output, Tensor? grad_state,"
+      " Tensor state, Tensor x, Tensor dt, Tensor A, Tensor B, Tensor C,"
+      " Tensor? D=None, Tensor? z=None, Tensor? dt_bias=None, bool softplus=True)"
+      " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor?, Tensor?, Tensor?)");
 }
 
 TORCH_LIBRARY_IMPL(ssm, CPU, m) {
-  m.impl("selective_scan", selective_scan_cpu);
-  m.impl("selective_scan_backward", selective_scan_backward_cpu);
+  m.impl("selective_scan", ssm::cpu::selective_scan_cpu);
+  m.impl("selective_scan_backward", ssm::cpu::selective_scan_backward_cpu);
+  m.impl("selective_state_step", ssm::cpu::selective_state_step_cpu);
+  m.impl("selective_state_step_backward",
+          ssm::cpu::selective_state_step_backward_cpu);
 }
 
