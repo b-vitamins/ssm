@@ -486,6 +486,9 @@ class _SelectiveStateStepFunction(torch.autograd.Function):
         grad_output: Optional[torch.Tensor],
         grad_state: Optional[torch.Tensor],
     ) -> tuple[Optional[torch.Tensor], ...]:
+        ops = _load_cpu_ops()
+        assert ops is not None
+
         state_saved, x, dt, A, B, C = ctx.saved_tensors
         D: Optional[torch.Tensor] = ctx.D
         z: Optional[torch.Tensor] = ctx.z
@@ -493,79 +496,35 @@ class _SelectiveStateStepFunction(torch.autograd.Function):
         softplus: bool = ctx.softplus
         req = ctx.input_requires_grad
 
-        with torch.enable_grad():
-            state_ref = state_saved.detach().clone().requires_grad_(req[0])
-            x_ref = x.detach().clone().requires_grad_(req[1])
-            dt_ref = dt.detach().clone().requires_grad_(req[2])
-            A_ref = A.detach().clone().requires_grad_(req[3])
-            B_ref = B.detach().clone().requires_grad_(req[4])
-            C_ref = C.detach().clone().requires_grad_(req[5])
-            D_ref = D.detach().clone().requires_grad_(req[6]) if D is not None else None
-            z_ref = z.detach().clone().requires_grad_(req[7]) if z is not None else None
-            dt_bias_ref = (
-                dt_bias.detach().clone().requires_grad_(req[8])
-                if dt_bias is not None
-                else None
-            )
+        grad_out = (
+            grad_output
+            if grad_output is not None
+            else torch.zeros_like(x, memory_format=torch.preserve_format)
+        )
 
-            out_ref, new_state_ref = _state_step_reference_no_inplace(
-                state_ref,
-                x_ref,
-                dt_ref,
-                A_ref,
-                B_ref,
-                C_ref,
-                D_ref,
-                z_ref,
-                dt_bias_ref,
-                softplus,
-            )
+        backward_results = ops.selective_state_step_backward(
+            grad_out,
+            grad_state,
+            state_saved,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            D,
+            z,
+            dt_bias,
+            softplus,
+        )
 
-            grad_out = (
-                grad_output.to(out_ref.dtype)
-                if grad_output is not None
-                else torch.zeros_like(out_ref)
-            )
-            grad_state_ref = (
-                grad_state.to(new_state_ref.dtype)
-                if grad_state is not None
-                else torch.zeros_like(new_state_ref)
-            )
-
-            inputs: list[torch.Tensor] = []
-            mapping: list[int] = []
-            candidates = [
-                state_ref,
-                x_ref,
-                dt_ref,
-                A_ref,
-                B_ref,
-                C_ref,
-                D_ref,
-                z_ref,
-                dt_bias_ref,
-            ]
-            for idx, tensor in enumerate(candidates):
-                if tensor is not None and tensor.requires_grad:
-                    inputs.append(tensor)
-                    mapping.append(idx)
-
-            grads: tuple[torch.Tensor, ...]
-            if inputs:
-                grads = torch.autograd.grad(
-                    outputs=(out_ref, new_state_ref),
-                    inputs=inputs,
-                    grad_outputs=(grad_out, grad_state_ref),
-                    allow_unused=True,
-                )
+        grads: list[Optional[torch.Tensor]] = []
+        for grad, needed in zip(backward_results, req):
+            if not needed:
+                grads.append(None)
             else:
-                grads = tuple()
+                grads.append(grad)
 
-        result: list[Optional[torch.Tensor]] = [None] * 9
-        for idx, grad in zip(mapping, grads):
-            result[idx] = grad
-
-        return (*result, None)
+        return (*grads, None)
 
 
 class _SelectiveStateStepCudaFunction(torch.autograd.Function):
