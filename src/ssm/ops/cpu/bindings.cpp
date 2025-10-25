@@ -50,6 +50,18 @@ at::Tensor ssd_chunk_scan_cpu(
     const c10::optional<at::Tensor>& cu_seqlens,
     const c10::optional<at::Tensor>& initial_states);
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           c10::optional<at::Tensor>, c10::optional<at::Tensor>,
+           c10::optional<at::Tensor>>
+ssd_chunk_scan_backward_cpu(
+    const at::Tensor& grad_output, const at::Tensor& X, const at::Tensor& dt,
+    const at::Tensor& A, const at::Tensor& B, const at::Tensor& C,
+    int64_t chunk_size, const c10::optional<at::Tensor>& D,
+    const c10::optional<at::Tensor>& z,
+    const c10::optional<at::Tensor>& seq_lens,
+    const c10::optional<at::Tensor>& cu_seqlens,
+    const c10::optional<at::Tensor>& initial_states);
+
 at::Tensor dw_causal_conv_cpu(const at::Tensor& x, const at::Tensor& weight,
                               const c10::optional<at::Tensor>& bias,
                               const std::string& activation);
@@ -95,6 +107,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("seq_lens") = c10::nullopt,
         py::arg("cu_seqlens") = c10::nullopt,
         py::arg("initial_states") = c10::nullopt);
+  m.def("ssd_chunk_scan_backward", &ssm::cpu::ssd_chunk_scan_backward_cpu,
+        "SSD chunk scan backward (CPU)", py::arg("grad_output"),
+        py::arg("X"), py::arg("dt"), py::arg("A"), py::arg("B"),
+        py::arg("C"), py::arg("chunk_size"), py::arg("D") = c10::nullopt,
+        py::arg("z") = c10::nullopt, py::arg("seq_lens") = c10::nullopt,
+        py::arg("cu_seqlens") = c10::nullopt,
+        py::arg("initial_states") = c10::nullopt);
   m.def("dw_causal_conv", &ssm::cpu::dw_causal_conv_cpu,
         "Depthwise causal conv (CPU)", py::arg("x"), py::arg("weight"),
         py::arg("bias") = c10::nullopt, py::arg("activation") = "silu");
@@ -124,6 +143,11 @@ TORCH_LIBRARY(ssm, m) {
       " Tensor state, Tensor x, Tensor dt, Tensor A, Tensor B, Tensor C,"
       " Tensor? D=None, Tensor? z=None, Tensor? dt_bias=None, bool softplus=True)"
       " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor?, Tensor?, Tensor?)");
+  m.def(
+      "ssd_chunk_scan_backward(Tensor grad_output, Tensor X, Tensor dt, Tensor A,"
+      " Tensor B, Tensor C, int chunk_size, Tensor? D=None, Tensor? z=None,"
+      " Tensor? seq_lens=None, Tensor? cu_seqlens=None, Tensor? initial_states=None)"
+      " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor?, Tensor?, Tensor?)");
 }
 
 TORCH_LIBRARY_IMPL(ssm, CPU, m) {
@@ -132,5 +156,7 @@ TORCH_LIBRARY_IMPL(ssm, CPU, m) {
   m.impl("selective_state_step", ssm::cpu::selective_state_step_cpu);
   m.impl("selective_state_step_backward",
           ssm::cpu::selective_state_step_backward_cpu);
+  m.impl("ssd_chunk_scan", ssm::cpu::ssd_chunk_scan_cpu);
+  m.impl("ssd_chunk_scan_backward", ssm::cpu::ssd_chunk_scan_backward_cpu);
 }
 

@@ -731,73 +731,50 @@ class _SSDChunkScanFunction(torch.autograd.Function):
         seq_meta: Optional[dict[str, Any]] = ctx.seq_meta
         initial_states: Optional[torch.Tensor] = ctx.initial_states
         chunk_size: int = ctx.chunk_size
-        req = ctx.input_requires_grad
 
-        with torch.enable_grad():
-            X_ref = X.detach().clone().requires_grad_(req[0])
-            dt_ref = dt.detach().clone().requires_grad_(req[1])
-            A_ref = A.detach().clone().requires_grad_(req[2])
-            B_ref = B.detach().clone().requires_grad_(req[3])
-            C_ref = C.detach().clone().requires_grad_(req[4])
-            D_ref = D.detach().clone().requires_grad_(req[5]) if D is not None else None
-            z_ref = z.detach().clone().requires_grad_(req[6]) if z is not None else None
-            init_ref = (
-                initial_states.detach().clone().requires_grad_(req[7])
-                if initial_states is not None
-                else None
-            )
+        ops = _load_cpu_ops()
+        assert ops is not None
 
-            out_ref = reference_ops.ssd_chunk_scan(
-                X_ref,
-                dt_ref,
-                A_ref,
-                B_ref,
-                C_ref,
-                chunk_size,
-                D=D_ref,
-                z=z_ref,
-                seq_meta=seq_meta,
-                initial_states=init_ref,
-            )
+        grad_out = grad_output if grad_output is not None else torch.zeros_like(X)
+        seq_lens_tensor, cu_seqlens_tensor = _prepare_seq_meta(seq_meta, X.device)
+        grad_results = ops.ssd_chunk_scan_backward(
+            grad_out.contiguous(),
+            X,
+            dt,
+            A,
+            B,
+            C,
+            chunk_size,
+            D,
+            z,
+            seq_lens_tensor,
+            cu_seqlens_tensor,
+            initial_states,
+        )
 
-            grad_out = (
-                grad_output if grad_output is not None else torch.zeros_like(out_ref)
-            )
+        (
+            grad_X,
+            grad_dt,
+            grad_A,
+            grad_B,
+            grad_C,
+            grad_D,
+            grad_z,
+            grad_initial,
+        ) = grad_results
 
-            inputs: list[torch.Tensor] = []
-            mapping: list[int] = []
-            candidates = [
-                X_ref,
-                dt_ref,
-                A_ref,
-                B_ref,
-                C_ref,
-                D_ref,
-                z_ref,
-                init_ref,
-            ]
-            for idx, tensor in enumerate(candidates):
-                if tensor is not None and tensor.requires_grad:
-                    inputs.append(tensor)
-                    mapping.append(idx)
-
-            grads: tuple[torch.Tensor, ...]
-            if inputs:
-                grads = torch.autograd.grad(
-                    outputs=out_ref,
-                    inputs=inputs,
-                    grad_outputs=grad_out,
-                    allow_unused=True,
-                )
-            else:
-                grads = tuple()
-
-        full: list[Optional[torch.Tensor]] = [None] * 10
-        positions = [0, 1, 2, 3, 4, 6, 7, 9]
-        for idx, grad in zip(mapping, grads):
-            full[positions[idx]] = grad
-
-        return tuple(full)
+        return (
+            grad_X,
+            grad_dt,
+            grad_A,
+            grad_B,
+            grad_C,
+            None,
+            grad_D,
+            grad_z,
+            None,
+            grad_initial,
+        )
 
 
 class _SSDChunkScanCudaFunction(torch.autograd.Function):

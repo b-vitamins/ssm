@@ -6,6 +6,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 ### Added
+- CPU SSD chunk scan backward kernel with Torch dispatch and Python autograd
+  integration mirroring the forward fused path.
 - CPU selective scan backward kernel with Torch operator registration and
   Python autograd dispatch to the compiled implementation.
 - Benchmark harness under `benchmarks/ops_bench.py` mirroring upstream Mamba
