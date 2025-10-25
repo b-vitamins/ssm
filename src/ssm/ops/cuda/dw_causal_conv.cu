@@ -596,6 +596,8 @@ at::Tensor dw_causal_conv_fallback(const at::Tensor& x,
   std::transform(act.begin(), act.end(), act.begin(), ::tolower);
   if (act == "silu" || act == "swish") {
     conv_out = at::silu(conv_out);
+  } else if (act == "relu") {
+    conv_out = at::relu(conv_out);
   } else if (act == "identity" || act == "none") {
     // no-op
   } else {
