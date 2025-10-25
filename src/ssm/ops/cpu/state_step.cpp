@@ -529,6 +529,23 @@ selective_state_step_backward_cpu(
     grad_dt_bias_compute = grad_dt_input.sum(0);
   }
 
+  auto collapse_grouped_grad = [&](const at::Tensor& grad,
+                                   const at::Tensor& original) {
+    if (original.dim() == 3 && original.size(1) != dim) {
+      const auto groups = original.size(1);
+      TORCH_INTERNAL_ASSERT(dim % groups == 0);
+      const auto dim_per_group = dim / groups;
+      auto reshaped = grad.view({batch, dim, state_dim})
+                         .view({batch, groups, dim_per_group, state_dim})
+                         .sum(2);
+      return reshaped.contiguous();
+    }
+    return grad;
+  };
+
+  grad_B_compute = collapse_grouped_grad(grad_B_compute, B);
+  grad_C_compute = collapse_grouped_grad(grad_C_compute, C);
+
   auto grad_state_result = grad_state_input_compute.to(state.scalar_type());
   auto grad_x_result = grad_x_compute.to(x.scalar_type());
   auto grad_dt_result = grad_dt_input.to(dt.scalar_type());
