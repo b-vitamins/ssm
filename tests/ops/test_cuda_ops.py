@@ -748,3 +748,86 @@ def test_fused_layer_norm_cuda_gradients_match_reference() -> None:
 
     for grad_cuda, grad_ref in zip(cuda_grads, ref_grads):
         torch.testing.assert_close(grad_cuda, grad_ref, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("prenorm", [False, True])
+@pytest.mark.parametrize("is_rms", [False, True])
+def test_fused_layer_norm_cuda_matches_reference_outputs(
+    is_rms: bool, prenorm: bool, has_bias: bool
+) -> None:
+    torch.manual_seed(6)
+    device = torch.device("cuda")
+    batch, length, hidden = 2, 3, 7
+
+    x = torch.randn(batch, length, hidden, device=device, dtype=torch.float32)
+    weight = torch.randn(hidden, device=device, dtype=torch.float32)
+    bias = torch.randn(hidden, device=device, dtype=torch.float32) if has_bias else None
+    residual = torch.randn(batch, length, hidden, device=device, dtype=torch.float32)
+
+    reference = reference_ops.fused_layer_norm(
+        x,
+        weight,
+        bias,
+        residual=residual,
+        is_rms=is_rms,
+        eps=1e-5,
+        prenorm=prenorm,
+        residual_in_fp32=False,
+    )
+    result = cast(
+        torch.Tensor,
+        ops.fused_layer_norm(
+            x,
+            weight,
+            bias,
+            residual=residual,
+            is_rms=is_rms,
+            eps=1e-5,
+            prenorm=prenorm,
+            residual_in_fp32=False,
+        ),
+    )
+
+    torch.testing.assert_close(result, reference, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("prenorm", [False, True])
+@pytest.mark.parametrize("is_rms", [False, True])
+def test_fused_layer_norm_cuda_mixed_precision_residual_fp32(
+    is_rms: bool, prenorm: bool
+) -> None:
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    batch, length, hidden = 1, 4, 16
+
+    x = torch.randn(batch, length, hidden, device=device, dtype=torch.float16)
+    weight = torch.randn(hidden, device=device, dtype=torch.float16)
+    bias = torch.randn(hidden, device=device, dtype=torch.float16)
+    residual = torch.randn(batch, length, hidden, device=device, dtype=torch.float32)
+
+    reference = reference_ops.fused_layer_norm(
+        x,
+        weight,
+        bias,
+        residual=residual,
+        is_rms=is_rms,
+        eps=1e-5,
+        prenorm=prenorm,
+        residual_in_fp32=True,
+    )
+    result = cast(
+        torch.Tensor,
+        ops.fused_layer_norm(
+            x,
+            weight,
+            bias,
+            residual=residual,
+            is_rms=is_rms,
+            eps=1e-5,
+            prenorm=prenorm,
+            residual_in_fp32=True,
+        ),
+    )
+
+    torch.testing.assert_close(result, reference, atol=5e-3, rtol=5e-3)
