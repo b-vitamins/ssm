@@ -26,6 +26,9 @@ dev = [
   "ruff",
   "pyright",
 ]
+bench = [
+  "tabulate>=0.9",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

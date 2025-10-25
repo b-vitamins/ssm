@@ -6,6 +6,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 ### Added
+- Benchmark harness under `benchmarks/ops_bench.py` mirroring upstream Mamba
+  workloads with docs, optional extras, and sample output for parity tracking.
 - CUDA SSD chunk scan GPU regression coverage for ragged cu_seqlens,
   initial-state plumbing, and a performance smoke harness.
 - Autograd-enabled CUDA dispatch for selective scan, state step, SSD chunk scan,
