@@ -2,6 +2,7 @@ from typing import cast
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import ssm.ops as ops
 from ssm.ops.python import reference as reference_ops
@@ -330,6 +331,88 @@ def test_ssd_chunk_scan_cuda_gradients_match_reference() -> None:
 
     for grad_cuda, grad_ref in zip(cuda_grads, ref_grads):
         torch.testing.assert_close(grad_cuda, grad_ref, atol=1e-4, rtol=1e-4)
+
+
+def test_ssd_chunk_scan_cuda_initial_state_and_cu_seqlens() -> None:
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+
+    batch, seqlen, heads, proj = 3, 20, 4, 8
+    chunk_size = 6
+
+    lengths = torch.tensor([20, 11, 7], device=device, dtype=torch.long)
+    cu_seqlens = F.pad(lengths.cumsum(dim=0), (1, 0), value=0)
+
+    X = torch.randn(batch, seqlen, heads, proj, device=device, dtype=torch.float32)
+    dt = torch.rand(batch, seqlen, heads, device=device, dtype=torch.float32)
+    A = torch.randn(heads, proj, device=device, dtype=torch.float32) * -0.01
+    B = torch.randn(batch, heads, proj, device=device, dtype=torch.float32)
+    C = torch.randn(batch, seqlen, heads, proj, device=device, dtype=torch.float32)
+    D = torch.randn(heads, proj, device=device, dtype=torch.float32) * 0.1
+    z = torch.randn(batch, seqlen, heads, 1, device=device, dtype=torch.float32)
+    init_state = torch.randn(batch, heads, proj, device=device, dtype=torch.float32)
+
+    seq_meta = {"cu_seqlens": cu_seqlens.to(device="cpu")}
+
+    ref_out = reference_ops.ssd_chunk_scan(
+        X.cpu(),
+        dt.cpu(),
+        A.cpu(),
+        B.cpu(),
+        C.cpu(),
+        chunk_size,
+        D=D.cpu(),
+        z=z.cpu(),
+        seq_meta=seq_meta,
+        initial_states=init_state.cpu(),
+    ).to(device)
+
+    cuda_out = ops.ssd_chunk_scan(
+        X,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D=D,
+        z=z,
+        seq_meta=seq_meta,
+        initial_states=init_state,
+    )
+
+    torch.testing.assert_close(cuda_out, ref_out, atol=1e-4, rtol=1e-4)
+
+
+def test_ssd_chunk_scan_cuda_performance_smoke() -> None:
+    torch.manual_seed(4)
+    device = torch.device("cuda")
+
+    batch, seqlen, heads, proj = 4, 256, 8, 64
+    chunk_size = 64
+
+    X = torch.randn(batch, seqlen, heads, proj, device=device, dtype=torch.float16)
+    dt = torch.rand(batch, seqlen, heads, device=device, dtype=torch.float16)
+    A = torch.randn(heads, proj, device=device, dtype=torch.float32) * -0.02
+    B = torch.randn(heads, proj, device=device, dtype=torch.float16)
+    C = torch.randn(heads, proj, device=device, dtype=torch.float16)
+
+    warmup_iters, iters = 2, 5
+    for _ in range(warmup_iters):
+        ops.ssd_chunk_scan(X, dt, A, B, C, chunk_size)
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    torch.cuda.synchronize()
+    start_event.record()
+    for _ in range(iters):
+        ops.ssd_chunk_scan(X, dt, A, B, C, chunk_size)
+    end_event.record()
+    end_event.synchronize()
+
+    elapsed_ms = start_event.elapsed_time(end_event) / iters
+    assert elapsed_ms > 0
+    assert elapsed_ms < 2000
 
 
 def test_selective_state_step_cuda_graph_capture() -> None:
