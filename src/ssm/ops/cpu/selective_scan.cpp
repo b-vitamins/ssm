@@ -450,11 +450,10 @@ selective_scan_backward_cpu(
 
               scalar_t grad_pre_gate = grad_out;
               scalar_t pre_gate = y_pre;
+              scalar_t d_skip = scalar_t(0);
               if (D_ptr != nullptr) {
-                const auto d_skip = D_ptr[d_idx];
+                d_skip = D_ptr[d_idx];
                 pre_gate += d_skip * u_val;
-                grad_u_acc[b][d_idx][t] += grad_pre_gate * conj_if_complex(d_skip);
-                grad_D_ptr[d_idx] += grad_pre_gate * conj_if_complex(u_val);
               }
 
               if (z_input_ptr != nullptr) {
@@ -465,6 +464,12 @@ selective_scan_backward_cpu(
                 const auto z_input_val = z_input_ptr[offset];
                 grad_z_ptr[offset] +=
                     grad_out * pre_gate * silu_grad(z_input_val);
+              }
+
+              if (D_ptr != nullptr) {
+                grad_u_acc[b][d_idx][t] +=
+                    grad_pre_gate * conj_if_complex(d_skip);
+                grad_D_ptr[d_idx] += grad_pre_gate * conj_if_complex(u_val);
               }
 
               const auto grad_y_pre = grad_pre_gate;
