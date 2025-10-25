@@ -951,54 +951,32 @@ class _DwCausalConvFunction(torch.autograd.Function):
         ctx,
         grad_output: Optional[torch.Tensor],
     ) -> tuple[Optional[torch.Tensor], ...]:
-        saved = ctx.saved_tensors
-        x = saved[0]
-        weight = saved[1]
-        bias_tensor = saved[2] if ctx.has_bias else None
+        x, weight, bias_placeholder = ctx.saved_tensors
         activation: str = ctx.activation
+        has_bias: bool = ctx.has_bias
         req = ctx.input_requires_grad
 
-        with torch.enable_grad():
-            x_ref = x.detach().clone().requires_grad_(req[0])
-            weight_ref = weight.detach().clone().requires_grad_(req[1])
-            if ctx.has_bias and bias_tensor is not None:
-                bias_ref = bias_tensor.detach().clone().requires_grad_(req[2])
-            else:
-                bias_ref = None
+        grad_out = grad_output if grad_output is not None else torch.zeros_like(x)
 
-            out_ref = reference_ops.dw_causal_conv(
-                x_ref,
-                weight_ref,
-                bias=bias_ref,
-                activation=activation,
-            )
+        ops = _load_cpu_ops()
+        assert ops is not None
 
-            grad_out = (
-                grad_output if grad_output is not None else torch.zeros_like(out_ref)
-            )
+        bias_tensor = bias_placeholder if has_bias else None
+        grad_x, grad_weight, grad_bias = ops.dw_causal_conv_backward(
+            grad_out,
+            x,
+            weight,
+            bias_tensor,
+            activation,
+        )
 
-            inputs: list[torch.Tensor] = []
-            mapping: list[int] = []
-            candidates = [x_ref, weight_ref, bias_ref]
-            for idx, tensor in enumerate(candidates):
-                if tensor is not None and tensor.requires_grad:
-                    inputs.append(tensor)
-                    mapping.append(idx)
-
-            grads: tuple[torch.Tensor, ...]
-            if inputs:
-                grads = torch.autograd.grad(
-                    outputs=out_ref,
-                    inputs=inputs,
-                    grad_outputs=grad_out,
-                    allow_unused=True,
-                )
-            else:
-                grads = tuple()
-
-        result: list[Optional[torch.Tensor]] = [None] * 3
-        for idx, grad in zip(mapping, grads):
-            result[idx] = grad
+        result: list[Optional[torch.Tensor]] = [None, None, None]
+        if req[0]:
+            result[0] = grad_x
+        if req[1]:
+            result[1] = grad_weight
+        if has_bias and req[2]:
+            result[2] = grad_bias
 
         return (*result, None)
 
