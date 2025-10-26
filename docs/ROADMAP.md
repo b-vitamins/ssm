@@ -22,7 +22,10 @@ This roadmap outlines milestones for implementing SSM Core on top of the scaffol
 
 ## Phase 2 — CPU Fused Kernels
 - Implement fused CPU kernels per op with threading and vectorization.
-- Integrate with dispatch; ensure autograd coverage.
+- Integrate with dispatch; ensure autograd coverage. **Done** via dedicated CPU
+  backward kernels for selective scan, selective state step, and SSD chunk scan;
+  follow-up is expanding gradient performance benchmarks across ragged metadata
+  and grouped parameter sweeps.
 - Add performance smoke tests and microbenchmarks.
 
 ## Phase 3 — CUDA Kernels

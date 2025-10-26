@@ -6,6 +6,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 ### Added
+- CPU selective scan, selective state step, and SSD chunk scan backward kernels
+  with autograd regression tests validating gradients against the reference
+  implementation.
 - CPU SSD chunk scan backward kernel with Torch dispatch and Python autograd
   integration mirroring the forward fused path.
 - CPU selective scan backward kernel with Torch operator registration and
