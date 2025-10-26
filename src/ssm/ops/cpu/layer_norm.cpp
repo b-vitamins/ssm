@@ -293,13 +293,15 @@ fused_layer_norm_backward_cpu(
   auto norm_input_grad = norm_input.to(compute_dtype);
   auto inv_std_grad = inv_std.to(compute_dtype);
   auto normalized_grad = normalized.to(compute_dtype);
+  auto norm_input_grad_conj = at::conj(norm_input_grad);
+  auto normalized_grad_conj = at::conj(normalized_grad);
 
   auto weight_view = weight_compute.view({1, 1, dim});
   auto grad_pre_out = grad_output_compute;
 
   std::vector<int64_t> reduce_dims = {0, 1};
   auto grad_weight_compute =
-      (grad_pre_out * normalized_grad).sum(reduce_dims);
+      (grad_pre_out * normalized_grad_conj).sum(reduce_dims);
 
   at::Tensor grad_bias_compute;
   if (has_bias) {
@@ -310,12 +312,12 @@ fused_layer_norm_backward_cpu(
 
   at::Tensor grad_norm_input;
   if (is_rms) {
-    auto cross = (grad_norm * norm_input_grad).sum(-1, true);
+    auto cross = (grad_norm * norm_input_grad_conj).sum(-1, true);
     auto factor = (cross / dim) * inv_std_grad * inv_std_grad * inv_std_grad;
     grad_norm_input = grad_norm * inv_std_grad - norm_input_grad * factor;
   } else {
     auto grad_norm_sum = grad_norm.sum(-1, true);
-    auto grad_norm_dot = (grad_norm * normalized_grad).sum(-1, true);
+    auto grad_norm_dot = (grad_norm * normalized_grad_conj).sum(-1, true);
     auto scaled = grad_norm * dim - grad_norm_sum - normalized_grad * grad_norm_dot;
     grad_norm_input = scaled * (inv_std_grad / dim);
   }
