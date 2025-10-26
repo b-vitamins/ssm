@@ -11,6 +11,7 @@ Example::
 
     $ python -m benchmarks.ops_bench --device cpu
     $ python -m benchmarks.ops_bench --device cuda --dtype float16
+    $ python -m benchmarks.ops_bench --device cpu --mode backward
 
 Use ``--json`` to emit the raw timing samples for downstream analysis
 (e.g. plotting, regression gates).
@@ -79,6 +80,7 @@ class Timing:
     op: str
     case: str
     device: str
+    mode: str
     backend: str
     time_ms: float | None
     speedup_vs_python: float | None
@@ -157,6 +159,53 @@ def _with_grad_disabled(fn: Callable[[], None]) -> Callable[[], None]:
             fn()
 
     return wrapper
+
+
+def _prepare_autograd_inputs(
+    base_inputs: dict[str, torch.Tensor],
+    *,
+    grad_keys: Sequence[str],
+    clone_keys: Sequence[str] = (),
+) -> dict[str, torch.Tensor]:
+    """Detach and clone tensors before enabling gradients for benchmarking."""
+
+    prepared: dict[str, torch.Tensor] = {}
+    grad_key_set = set(grad_keys)
+    clone_key_set = set(clone_keys)
+
+    for name, value in base_inputs.items():
+        tensor = value
+        if name in grad_key_set or name in clone_key_set:
+            tensor = tensor.detach().clone()
+        if name in grad_key_set and tensor.is_floating_point():
+            tensor.requires_grad_(True)
+        prepared[name] = tensor
+
+    return prepared
+
+
+def _grad_enabled_keys(
+    inputs: dict[str, torch.Tensor], candidates: Sequence[str]
+) -> tuple[str, ...]:
+    return tuple(
+        name
+        for name in candidates
+        if name in inputs and inputs[name].is_floating_point()
+    )
+
+
+def _autograd_targets(
+    inputs: dict[str, torch.Tensor], grad_keys: Sequence[str]
+) -> list[torch.Tensor]:
+    return [inputs[name] for name in grad_keys if inputs[name].requires_grad]
+
+
+def _ensure_tensor(
+    output: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+) -> torch.Tensor:
+    if isinstance(output, tuple):
+        return output[0]
+    return output
 
 
 def _selective_scan_inputs(
@@ -263,12 +312,14 @@ def _benchmark_backend(
     device: torch.device,
     *,
     iters: int,
+    mode: str,
 ) -> tuple[list[float] | None, str]:
     runner = fn_builder(name)
     if runner is None:
         return None, "unavailable"
-    wrapped = _with_grad_disabled(runner)
-    samples = _time_fn(wrapped, device=device, iters=iters)
+    if mode == "forward":
+        runner = _with_grad_disabled(runner)
+    samples = _time_fn(runner, device=device, iters=iters)
     return samples, ""
 
 
@@ -296,94 +347,162 @@ def _build_selective_scan_runners(
     dtype: torch.dtype,
     *,
     iters: int,
+    mode: str,
 ) -> list[Timing]:
     inputs = _selective_scan_inputs(case, device, dtype)
+    grad_keys = _grad_enabled_keys(
+        inputs, ("u", "delta", "A", "B", "C", "D", "z", "dt_bias")
+    )
     backend_samples: dict[str, list[float]] = {}
     notes: dict[str, str] = {}
+    extra_notes: dict[str, str] = {}
 
     def make_runner(backend: str) -> Callable[[], None] | None:
         if backend == "python":
 
-            def run() -> None:
-                reference_ops.selective_scan(
-                    inputs["u"],
-                    inputs["delta"],
-                    inputs["A"],
-                    inputs["B"],
-                    inputs["C"],
-                    D=inputs.get("D"),
-                    z=inputs.get("z"),
-                    dt_bias=inputs.get("dt_bias"),
-                    softplus=case.softplus,
-                    return_last_state=False,
+            def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                return _ensure_tensor(
+                    reference_ops.selective_scan(
+                        current_inputs["u"],
+                        current_inputs["delta"],
+                        current_inputs["A"],
+                        current_inputs["B"],
+                        current_inputs["C"],
+                        D=current_inputs.get("D"),
+                        z=current_inputs.get("z"),
+                        dt_bias=current_inputs.get("dt_bias"),
+                        softplus=case.softplus,
+                        return_last_state=False,
+                    )
                 )
 
-            return run
-        if backend == "cpu":
+        elif backend == "cpu":
             module = _load_cpu_ops()
             if module is None:
                 return None
+            if mode == "backward":
+                extra_notes[backend] = "autograd (dispatch wrapper)"
 
-            def run() -> None:
-                module.selective_scan(  # type: ignore[call-arg]
-                    inputs["u"],
-                    inputs["delta"],
-                    inputs["A"],
-                    inputs["B"],
-                    inputs["C"],
-                    inputs.get("D"),
-                    inputs.get("z"),
-                    inputs.get("dt_bias"),
-                    case.softplus,
-                    False,
-                )
+                def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                    return _ensure_tensor(
+                        dispatch_ops.selective_scan(
+                            current_inputs["u"],
+                            current_inputs["delta"],
+                            current_inputs["A"],
+                            current_inputs["B"],
+                            current_inputs["C"],
+                            D=current_inputs.get("D"),
+                            z=current_inputs.get("z"),
+                            dt_bias=current_inputs.get("dt_bias"),
+                            softplus=case.softplus,
+                            return_last_state=False,
+                        )
+                    )
 
-            return run
-        if backend == "cuda":
+            else:
+
+                def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                    return module.selective_scan(  # type: ignore[call-arg]
+                        current_inputs["u"],
+                        current_inputs["delta"],
+                        current_inputs["A"],
+                        current_inputs["B"],
+                        current_inputs["C"],
+                        current_inputs.get("D"),
+                        current_inputs.get("z"),
+                        current_inputs.get("dt_bias"),
+                        case.softplus,
+                        False,
+                    )
+
+        elif backend == "cuda":
             module = _load_cuda_ops()
             if module is None:
                 return None
+            if mode == "backward":
+                extra_notes[backend] = "autograd (dispatch wrapper)"
 
-            def run() -> None:
-                module.selective_scan(  # type: ignore[call-arg]
-                    inputs["u"],
-                    inputs["delta"],
-                    inputs["A"],
-                    inputs["B"],
-                    inputs["C"],
-                    inputs.get("D"),
-                    inputs.get("z"),
-                    inputs.get("dt_bias"),
-                    case.softplus,
-                    False,
+                def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                    return _ensure_tensor(
+                        dispatch_ops.selective_scan(
+                            current_inputs["u"],
+                            current_inputs["delta"],
+                            current_inputs["A"],
+                            current_inputs["B"],
+                            current_inputs["C"],
+                            D=current_inputs.get("D"),
+                            z=current_inputs.get("z"),
+                            dt_bias=current_inputs.get("dt_bias"),
+                            softplus=case.softplus,
+                            return_last_state=False,
+                        )
+                    )
+
+            else:
+
+                def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                    return module.selective_scan(  # type: ignore[call-arg]
+                        current_inputs["u"],
+                        current_inputs["delta"],
+                        current_inputs["A"],
+                        current_inputs["B"],
+                        current_inputs["C"],
+                        current_inputs.get("D"),
+                        current_inputs.get("z"),
+                        current_inputs.get("dt_bias"),
+                        case.softplus,
+                        False,
+                    )
+
+        elif backend == "dispatch":
+
+            def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                return _ensure_tensor(
+                    dispatch_ops.selective_scan(
+                        current_inputs["u"],
+                        current_inputs["delta"],
+                        current_inputs["A"],
+                        current_inputs["B"],
+                        current_inputs["C"],
+                        D=current_inputs.get("D"),
+                        z=current_inputs.get("z"),
+                        dt_bias=current_inputs.get("dt_bias"),
+                        softplus=case.softplus,
+                        return_last_state=False,
+                    )
                 )
 
-            return run
-        if backend == "dispatch":
+        else:
+            raise ValueError(f"unknown backend {backend}")
 
-            def run() -> None:
-                dispatch_ops.selective_scan(
-                    inputs["u"],
-                    inputs["delta"],
-                    inputs["A"],
-                    inputs["B"],
-                    inputs["C"],
-                    D=inputs.get("D"),
-                    z=inputs.get("z"),
-                    dt_bias=inputs.get("dt_bias"),
-                    softplus=case.softplus,
-                    return_last_state=False,
-                )
+        if mode == "forward":
 
-            return run
-        raise ValueError(f"unknown backend {backend}")
+            def run_forward() -> None:
+                call(inputs)
+
+            return run_forward
+
+        def run_backward() -> None:
+            prepared = _prepare_autograd_inputs(
+                inputs, grad_keys=grad_keys, clone_keys=()
+            )
+            output = call(prepared)
+            loss = output.sum()
+            targets = _autograd_targets(prepared, grad_keys)
+            if targets:
+                torch.autograd.grad(loss, targets, allow_unused=True)
+
+        return run_backward
 
     order = _backend_order(device)
     for backend in order:
-        samples, note = _benchmark_backend(backend, make_runner, device, iters=iters)
+        samples, note = _benchmark_backend(
+            backend, make_runner, device, iters=iters, mode=mode
+        )
         if samples is not None:
             backend_samples[backend] = samples
-        notes[backend] = note
+        combined_note = note or extra_notes.get(backend, "")
+        notes[backend] = combined_note
 
     python_time = statistics.mean(backend_samples.get("python", [math.nan]))
     timings: list[Timing] = []
@@ -403,6 +522,7 @@ def _build_selective_scan_runners(
                     op="selective_scan",
                     case=case.name,
                     device=device.type,
+                    mode=mode,
                     backend=backend,
                     time_ms=mean_time,
                     speedup_vs_python=speedup,
@@ -415,6 +535,7 @@ def _build_selective_scan_runners(
                     op="selective_scan",
                     case=case.name,
                     device=device.type,
+                    mode=mode,
                     backend=backend,
                     time_ms=None,
                     speedup_vs_python=None,
@@ -430,94 +551,156 @@ def _build_state_step_runners(
     dtype: torch.dtype,
     *,
     iters: int,
+    mode: str,
 ) -> list[Timing]:
     inputs = _state_step_inputs(case, device, dtype)
+    grad_keys = _grad_enabled_keys(
+        inputs, ("state", "x", "dt", "A", "B", "C", "D", "z", "dt_bias")
+    )
     backend_samples: dict[str, list[float]] = {}
     notes: dict[str, str] = {}
+    extra_notes: dict[str, str] = {}
 
     def make_runner(backend: str) -> Callable[[], None] | None:
         if backend == "python":
 
-            def run() -> None:
-                reference_ops.selective_state_step(
-                    inputs["state"].clone(),
-                    inputs["x"],
-                    inputs["dt"],
-                    inputs["A"],
-                    inputs["B"],
-                    inputs["C"],
-                    D=inputs.get("D"),
-                    z=inputs.get("z"),
-                    dt_bias=inputs.get("dt_bias"),
+            def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                return reference_ops.selective_state_step(
+                    current_inputs["state"],
+                    current_inputs["x"],
+                    current_inputs["dt"],
+                    current_inputs["A"],
+                    current_inputs["B"],
+                    current_inputs["C"],
+                    D=current_inputs.get("D"),
+                    z=current_inputs.get("z"),
+                    dt_bias=current_inputs.get("dt_bias"),
                     softplus=case.softplus,
                 )
 
-            return run
-        if backend == "cpu":
+        elif backend == "cpu":
             module = _load_cpu_ops()
             if module is None:
                 return None
+            if mode == "backward":
+                extra_notes[backend] = "autograd (dispatch wrapper)"
 
-            def run() -> None:
-                module.selective_state_step(  # type: ignore[call-arg]
-                    inputs["state"].clone(),
-                    inputs["x"],
-                    inputs["dt"],
-                    inputs["A"],
-                    inputs["B"],
-                    inputs["C"],
-                    inputs.get("D"),
-                    inputs.get("z"),
-                    inputs.get("dt_bias"),
-                    case.softplus,
-                )
+                def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                    return dispatch_ops.selective_state_step(
+                        current_inputs["state"],
+                        current_inputs["x"],
+                        current_inputs["dt"],
+                        current_inputs["A"],
+                        current_inputs["B"],
+                        current_inputs["C"],
+                        D=current_inputs.get("D"),
+                        z=current_inputs.get("z"),
+                        dt_bias=current_inputs.get("dt_bias"),
+                        softplus=case.softplus,
+                    )
 
-            return run
-        if backend == "cuda":
+            else:
+
+                def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                    return module.selective_state_step(  # type: ignore[call-arg]
+                        current_inputs["state"],
+                        current_inputs["x"],
+                        current_inputs["dt"],
+                        current_inputs["A"],
+                        current_inputs["B"],
+                        current_inputs["C"],
+                        current_inputs.get("D"),
+                        current_inputs.get("z"),
+                        current_inputs.get("dt_bias"),
+                        case.softplus,
+                    )
+
+        elif backend == "cuda":
             module = _load_cuda_ops()
             if module is None:
                 return None
+            if mode == "backward":
+                extra_notes[backend] = "autograd (dispatch wrapper)"
 
-            def run() -> None:
-                module.selective_state_step(  # type: ignore[call-arg]
-                    inputs["state"].clone(),
-                    inputs["x"],
-                    inputs["dt"],
-                    inputs["A"],
-                    inputs["B"],
-                    inputs["C"],
-                    inputs.get("D"),
-                    inputs.get("z"),
-                    inputs.get("dt_bias"),
-                    case.softplus,
-                )
+                def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                    return dispatch_ops.selective_state_step(
+                        current_inputs["state"],
+                        current_inputs["x"],
+                        current_inputs["dt"],
+                        current_inputs["A"],
+                        current_inputs["B"],
+                        current_inputs["C"],
+                        D=current_inputs.get("D"),
+                        z=current_inputs.get("z"),
+                        dt_bias=current_inputs.get("dt_bias"),
+                        softplus=case.softplus,
+                    )
 
-            return run
-        if backend == "dispatch":
+            else:
 
-            def run() -> None:
-                dispatch_ops.selective_state_step(
-                    inputs["state"].clone(),
-                    inputs["x"],
-                    inputs["dt"],
-                    inputs["A"],
-                    inputs["B"],
-                    inputs["C"],
-                    D=inputs.get("D"),
-                    z=inputs.get("z"),
-                    dt_bias=inputs.get("dt_bias"),
+                def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                    return module.selective_state_step(  # type: ignore[call-arg]
+                        current_inputs["state"],
+                        current_inputs["x"],
+                        current_inputs["dt"],
+                        current_inputs["A"],
+                        current_inputs["B"],
+                        current_inputs["C"],
+                        current_inputs.get("D"),
+                        current_inputs.get("z"),
+                        current_inputs.get("dt_bias"),
+                        case.softplus,
+                    )
+
+        elif backend == "dispatch":
+
+            def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                return dispatch_ops.selective_state_step(
+                    current_inputs["state"],
+                    current_inputs["x"],
+                    current_inputs["dt"],
+                    current_inputs["A"],
+                    current_inputs["B"],
+                    current_inputs["C"],
+                    D=current_inputs.get("D"),
+                    z=current_inputs.get("z"),
+                    dt_bias=current_inputs.get("dt_bias"),
                     softplus=case.softplus,
                 )
 
-            return run
-        raise ValueError(f"unknown backend {backend}")
+        else:
+            raise ValueError(f"unknown backend {backend}")
+
+        if mode == "forward":
+
+            def run_forward() -> None:
+                state_inputs = inputs.copy()
+                state_inputs["state"] = state_inputs["state"].clone()
+                call(state_inputs)
+
+            return run_forward
+
+        def run_backward() -> None:
+            prepared = _prepare_autograd_inputs(
+                inputs, grad_keys=grad_keys, clone_keys=("state",)
+            )
+            output = call(prepared)
+            loss = output.sum()
+            targets = _autograd_targets(prepared, grad_keys)
+            if targets:
+                torch.autograd.grad(loss, targets, allow_unused=True)
+
+        return run_backward
 
     order = _backend_order(device)
     for backend in order:
-        samples, note = _benchmark_backend(backend, make_runner, device, iters=iters)
+        samples, note = _benchmark_backend(
+            backend, make_runner, device, iters=iters, mode=mode
+        )
         if samples is not None:
             backend_samples[backend] = samples
-        notes[backend] = note
+        combined_note = note or extra_notes.get(backend, "")
+        notes[backend] = combined_note
 
     python_time = statistics.mean(backend_samples.get("python", [math.nan]))
     timings: list[Timing] = []
@@ -537,6 +720,7 @@ def _build_state_step_runners(
                     op="selective_state_step",
                     case=case.name,
                     device=device.type,
+                    mode=mode,
                     backend=backend,
                     time_ms=mean_time,
                     speedup_vs_python=speedup,
@@ -549,6 +733,7 @@ def _build_state_step_runners(
                     op="selective_state_step",
                     case=case.name,
                     device=device.type,
+                    mode=mode,
                     backend=backend,
                     time_ms=None,
                     speedup_vs_python=None,
@@ -564,96 +749,152 @@ def _build_chunk_scan_runners(
     dtype: torch.dtype,
     *,
     iters: int,
+    mode: str,
 ) -> list[Timing]:
     tensors, chunk_size = _chunk_scan_inputs(case, device, dtype)
+    grad_keys = _grad_enabled_keys(tensors, ("X", "dt", "A", "B", "C", "D", "z"))
     backend_samples: dict[str, list[float]] = {}
     notes: dict[str, str] = {}
+    extra_notes: dict[str, str] = {}
 
     def make_runner(backend: str) -> Callable[[], None] | None:
         if backend == "python":
 
-            def run() -> None:
-                reference_ops.ssd_chunk_scan(
-                    tensors["X"],
-                    tensors["dt"],
-                    tensors["A"],
-                    tensors["B"],
-                    tensors["C"],
+            def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                return reference_ops.ssd_chunk_scan(
+                    current_inputs["X"],
+                    current_inputs["dt"],
+                    current_inputs["A"],
+                    current_inputs["B"],
+                    current_inputs["C"],
                     chunk_size,
-                    D=tensors.get("D"),
-                    z=tensors.get("z"),
+                    D=current_inputs.get("D"),
+                    z=current_inputs.get("z"),
                     seq_meta=None,
                     initial_states=None,
                 )
 
-            return run
-        if backend == "cpu":
+        elif backend == "cpu":
             module = _load_cpu_ops()
             if module is None:
                 return None
+            if mode == "backward":
+                extra_notes[backend] = "autograd (dispatch wrapper)"
 
-            def run() -> None:
-                module.ssd_chunk_scan(  # type: ignore[call-arg]
-                    tensors["X"],
-                    tensors["dt"],
-                    tensors["A"],
-                    tensors["B"],
-                    tensors["C"],
-                    chunk_size,
-                    tensors.get("D"),
-                    tensors.get("z"),
-                    None,
-                    None,
-                    None,
-                )
+                def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                    return dispatch_ops.ssd_chunk_scan(
+                        current_inputs["X"],
+                        current_inputs["dt"],
+                        current_inputs["A"],
+                        current_inputs["B"],
+                        current_inputs["C"],
+                        chunk_size,
+                        D=current_inputs.get("D"),
+                        z=current_inputs.get("z"),
+                        seq_meta=None,
+                        initial_states=None,
+                    )
 
-            return run
-        if backend == "cuda":
+            else:
+
+                def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                    return module.ssd_chunk_scan(  # type: ignore[call-arg]
+                        current_inputs["X"],
+                        current_inputs["dt"],
+                        current_inputs["A"],
+                        current_inputs["B"],
+                        current_inputs["C"],
+                        chunk_size,
+                        current_inputs.get("D"),
+                        current_inputs.get("z"),
+                        None,
+                        None,
+                        None,
+                    )
+
+        elif backend == "cuda":
             module = _load_cuda_ops()
             if module is None:
                 return None
+            if mode == "backward":
+                extra_notes[backend] = "autograd (dispatch wrapper)"
 
-            def run() -> None:
-                module.ssd_chunk_scan(  # type: ignore[call-arg]
-                    tensors["X"],
-                    tensors["dt"],
-                    tensors["A"],
-                    tensors["B"],
-                    tensors["C"],
+                def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                    return dispatch_ops.ssd_chunk_scan(
+                        current_inputs["X"],
+                        current_inputs["dt"],
+                        current_inputs["A"],
+                        current_inputs["B"],
+                        current_inputs["C"],
+                        chunk_size,
+                        D=current_inputs.get("D"),
+                        z=current_inputs.get("z"),
+                        seq_meta=None,
+                        initial_states=None,
+                    )
+
+            else:
+
+                def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                    return module.ssd_chunk_scan(  # type: ignore[call-arg]
+                        current_inputs["X"],
+                        current_inputs["dt"],
+                        current_inputs["A"],
+                        current_inputs["B"],
+                        current_inputs["C"],
+                        chunk_size,
+                        current_inputs.get("D"),
+                        current_inputs.get("z"),
+                        None,
+                        None,
+                        None,
+                    )
+
+        elif backend == "dispatch":
+
+            def call(current_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                return dispatch_ops.ssd_chunk_scan(
+                    current_inputs["X"],
+                    current_inputs["dt"],
+                    current_inputs["A"],
+                    current_inputs["B"],
+                    current_inputs["C"],
                     chunk_size,
-                    tensors.get("D"),
-                    tensors.get("z"),
-                    None,
-                    None,
-                    None,
-                )
-
-            return run
-        if backend == "dispatch":
-
-            def run() -> None:
-                dispatch_ops.ssd_chunk_scan(
-                    tensors["X"],
-                    tensors["dt"],
-                    tensors["A"],
-                    tensors["B"],
-                    tensors["C"],
-                    chunk_size,
-                    D=tensors.get("D"),
-                    z=tensors.get("z"),
+                    D=current_inputs.get("D"),
+                    z=current_inputs.get("z"),
                     seq_meta=None,
                     initial_states=None,
                 )
 
-            return run
-        raise ValueError(f"unknown backend {backend}")
+        else:
+            raise ValueError(f"unknown backend {backend}")
+
+        if mode == "forward":
+
+            def run_forward() -> None:
+                call(tensors)
+
+            return run_forward
+
+        def run_backward() -> None:
+            prepared = _prepare_autograd_inputs(tensors, grad_keys=grad_keys)
+            output = call(prepared)
+            loss = output.sum()
+            targets = _autograd_targets(prepared, grad_keys)
+            if targets:
+                torch.autograd.grad(loss, targets, allow_unused=True)
+
+        return run_backward
 
     order = _backend_order(device)
     for backend in order:
-        samples, note = _benchmark_backend(backend, make_runner, device, iters=iters)
+        samples, note = _benchmark_backend(
+            backend, make_runner, device, iters=iters, mode=mode
+        )
         if samples is not None:
             backend_samples[backend] = samples
-        notes[backend] = note
+        combined_note = note or extra_notes.get(backend, "")
+        notes[backend] = combined_note
 
     python_time = statistics.mean(backend_samples.get("python", [math.nan]))
     timings: list[Timing] = []
@@ -673,6 +914,7 @@ def _build_chunk_scan_runners(
                     op="ssd_chunk_scan",
                     case=case.name,
                     device=device.type,
+                    mode=mode,
                     backend=backend,
                     time_ms=mean_time,
                     speedup_vs_python=speedup,
@@ -685,6 +927,7 @@ def _build_chunk_scan_runners(
                     op="ssd_chunk_scan",
                     case=case.name,
                     device=device.type,
+                    mode=mode,
                     backend=backend,
                     time_ms=None,
                     speedup_vs_python=None,
@@ -723,6 +966,7 @@ def _emit_json(path: str, timings: Sequence[Timing]) -> None:
             "op": t.op,
             "case": t.case,
             "device": t.device,
+            "mode": t.mode,
             "backend": t.backend,
             "time_ms": t.time_ms,
             "speedup_vs_python": t.speedup_vs_python,
@@ -735,14 +979,14 @@ def _emit_json(path: str, timings: Sequence[Timing]) -> None:
 
 
 def _summarise(timings: Sequence[Timing]) -> str:
-    grouped: dict[tuple[str, str, str], list[Timing]] = {}
+    grouped: dict[tuple[str, str, str, str], list[Timing]] = {}
     for timing in timings:
-        key = (timing.op, timing.case, timing.device)
+        key = (timing.op, timing.case, timing.device, timing.mode)
         grouped.setdefault(key, []).append(timing)
 
     lines: list[str] = []
-    for (op, case, device), group in sorted(grouped.items()):
-        lines.append(f"== {op} :: {case} :: device={device} ==")
+    for (op, case, device, mode), group in sorted(grouped.items()):
+        lines.append(f"== {op} :: {case} :: device={device} :: mode={mode} ==")
         rows: list[list[Any]] = []
         backend_order = {
             name: idx for idx, name in enumerate(("python", "cpu", "cuda", "dispatch"))
@@ -789,6 +1033,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Number of timed iterations per backend (default: 10).",
     )
     parser.add_argument(
+        "--mode",
+        choices=["forward", "backward"],
+        default="forward",
+        help="Measure forward execution or forward+backward autograd timings.",
+    )
+    parser.add_argument(
         "--json",
         type=str,
         default=None,
@@ -803,19 +1053,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         for case in _SELECTIVE_SCAN_CASES:
             timings.extend(
                 _build_selective_scan_runners(
-                    case, device=device, dtype=dtype, iters=args.iters
+                    case,
+                    device=device,
+                    dtype=dtype,
+                    iters=args.iters,
+                    mode=args.mode,
                 )
             )
         for case in _STATE_STEP_CASES:
             timings.extend(
                 _build_state_step_runners(
-                    case, device=device, dtype=dtype, iters=args.iters
+                    case,
+                    device=device,
+                    dtype=dtype,
+                    iters=args.iters,
+                    mode=args.mode,
                 )
             )
         for case in _CHUNK_SCAN_CASES:
             timings.extend(
                 _build_chunk_scan_runners(
-                    case, device=device, dtype=dtype, iters=args.iters
+                    case,
+                    device=device,
+                    dtype=dtype,
+                    iters=args.iters,
+                    mode=args.mode,
                 )
             )
 
