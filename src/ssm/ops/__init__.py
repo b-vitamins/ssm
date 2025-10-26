@@ -1130,59 +1130,36 @@ class _FusedLayerNormFunction(torch.autograd.Function):
         is_rms, eps, prenorm, residual_in_fp32, has_bias, has_residual = ctx.flags
         req = ctx.input_requires_grad
 
-        with torch.enable_grad():
-            x_ref = x.detach().clone().requires_grad_(req[0])
-            weight_ref = weight.detach().clone().requires_grad_(req[1])
-            bias_ref = (
-                bias_tensor.detach().clone().requires_grad_(req[2])
-                if has_bias
-                else None
-            )
-            residual_ref = (
-                residual_tensor.detach().clone().requires_grad_(req[3])
-                if has_residual
-                else None
-            )
+        ops = _load_cpu_ops()
+        assert ops is not None
 
-            out_ref = reference_ops.fused_layer_norm(
-                x_ref,
-                weight_ref,
-                bias_ref,
-                residual=residual_ref,
-                is_rms=is_rms,
-                eps=eps,
-                prenorm=prenorm,
-                residual_in_fp32=residual_in_fp32,
-            )
+        grad_out_tensor = (
+            grad_output.contiguous() if grad_output is not None else torch.zeros_like(x)
+        )
 
-            grad_out = (
-                grad_output if grad_output is not None else torch.zeros_like(out_ref)
-            )
+        bias_arg = bias_tensor if has_bias else None
+        residual_arg = residual_tensor if has_residual else None
 
-            inputs: list[torch.Tensor] = []
-            mapping: list[int] = []
-            candidates = [x_ref, weight_ref, bias_ref, residual_ref]
-            for idx, tensor in enumerate(candidates):
-                if tensor is not None and tensor.requires_grad:
-                    inputs.append(tensor)
-                    mapping.append(idx)
+        grads = ops.fused_layer_norm_backward(
+            grad_out_tensor,
+            x,
+            weight,
+            bias_arg,
+            residual_arg,
+            is_rms,
+            eps,
+            prenorm,
+            residual_in_fp32,
+        )
 
-            grads: tuple[torch.Tensor, ...]
-            if inputs:
-                grads = torch.autograd.grad(
-                    outputs=out_ref,
-                    inputs=inputs,
-                    grad_outputs=grad_out,
-                    allow_unused=True,
-                )
+        grad_tensors: list[Optional[torch.Tensor]] = []
+        for flag, grad in zip(req, grads):
+            if not flag or grad is None:
+                grad_tensors.append(None)
             else:
-                grads = tuple()
+                grad_tensors.append(grad)
 
-        result: list[Optional[torch.Tensor]] = [None] * 4
-        for idx, grad in zip(mapping, grads):
-            result[idx] = grad
-
-        return (*result, None, None, None, None)
+        return (*grad_tensors, None, None, None, None)
 
 
 class _FusedLayerNormCudaFunction(torch.autograd.Function):

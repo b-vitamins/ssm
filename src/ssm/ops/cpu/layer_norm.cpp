@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <tuple>
+#include <vector>
 
 namespace ssm {
 namespace cpu {
@@ -54,8 +56,6 @@ at::Tensor fused_layer_norm_cpu(
       at::empty({x.size(0), x.size(1), x.size(2)},
                 x.options().dtype(compute_dtype));
 
-  const auto batch = x.size(0);
-  const auto length = x.size(1);
   const auto dim = x.size(2);
 
   AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES(
@@ -226,6 +226,123 @@ at::Tensor fused_layer_norm_cpu(
       });
 
   return output.to(x.scalar_type());
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+fused_layer_norm_backward_cpu(
+    const at::Tensor& grad_output, const at::Tensor& x,
+    const at::Tensor& weight, const c10::optional<at::Tensor>& bias,
+    const c10::optional<at::Tensor>& residual, bool is_rms, double eps,
+    bool prenorm, bool residual_in_fp32) {
+  TORCH_CHECK(x.dim() == 3, "x must have shape (B, L, D).");
+  TORCH_CHECK(weight.dim() == 1 && weight.size(0) == x.size(-1),
+              "weight must match the last dimension of x.");
+  TORCH_CHECK(grad_output.dim() == 3,
+              "grad_output must have shape (B, L, D).");
+  TORCH_CHECK(grad_output.sizes() == x.sizes(),
+              "grad_output must match the output shape of forward.");
+  if (bias.has_value()) {
+    const auto& bias_tensor = bias.value();
+    TORCH_CHECK(bias_tensor.dim() == 1 && bias_tensor.size(0) == x.size(-1),
+                "bias must match the last dimension of x.");
+  }
+  if (residual.has_value()) {
+    const auto& residual_tensor = residual.value();
+    TORCH_CHECK(residual_tensor.sizes() == x.sizes(),
+                "residual must match the shape of x.");
+  }
+
+  const auto dim = x.size(2);
+
+  auto compute_dtype = get_compute_dtype(x);
+  auto base_dtype =
+      residual_in_fp32 && residual.has_value() ? at::kFloat : compute_dtype;
+  const auto device = x.device();
+
+  auto x_compute = to_compute(x, base_dtype, device).contiguous();
+  at::Tensor residual_compute;
+  if (residual.has_value()) {
+    residual_compute =
+        to_compute(residual.value(), base_dtype, device).contiguous();
+  }
+
+  auto weight_compute =
+      to_compute(weight, compute_dtype, device).contiguous();
+  auto grad_output_compute =
+      to_compute(grad_output, compute_dtype, device).contiguous();
+
+  const bool has_residual = residual.has_value();
+  const bool has_bias = bias.has_value();
+  const bool add_pre = prenorm && has_residual;
+  at::Tensor norm_input = add_pre ? x_compute + residual_compute : x_compute;
+
+  at::Tensor inv_std;
+  at::Tensor normalized;
+  if (is_rms) {
+    auto mean_square = norm_input.pow(2).mean(-1, true);
+    inv_std = (mean_square + eps).rsqrt();
+    normalized = norm_input * inv_std;
+  } else {
+    auto mean = norm_input.mean(-1, true);
+    auto centered = norm_input - mean;
+    auto var = centered.pow(2).mean(-1, true);
+    inv_std = (var + eps).rsqrt();
+    normalized = centered * inv_std;
+  }
+
+  auto norm_input_grad = norm_input.to(compute_dtype);
+  auto inv_std_grad = inv_std.to(compute_dtype);
+  auto normalized_grad = normalized.to(compute_dtype);
+
+  auto weight_view = weight_compute.view({1, 1, dim});
+  auto grad_pre_out = grad_output_compute;
+
+  std::vector<int64_t> reduce_dims = {0, 1};
+  auto grad_weight_compute =
+      (grad_pre_out * normalized_grad).sum(reduce_dims);
+
+  at::Tensor grad_bias_compute;
+  if (has_bias) {
+    grad_bias_compute = grad_pre_out.sum(reduce_dims);
+  }
+
+  auto grad_norm = grad_pre_out * weight_view;
+
+  at::Tensor grad_norm_input;
+  if (is_rms) {
+    auto cross = (grad_norm * norm_input_grad).sum(-1, true);
+    auto factor = (cross / dim) * inv_std_grad * inv_std_grad * inv_std_grad;
+    grad_norm_input = grad_norm * inv_std_grad - norm_input_grad * factor;
+  } else {
+    auto grad_norm_sum = grad_norm.sum(-1, true);
+    auto grad_norm_dot = (grad_norm * normalized_grad).sum(-1, true);
+    auto scaled = grad_norm * dim - grad_norm_sum - normalized_grad * grad_norm_dot;
+    grad_norm_input = scaled * (inv_std_grad / dim);
+  }
+
+  at::Tensor grad_x_result = grad_norm_input.to(x.scalar_type());
+
+  at::Tensor grad_residual_result;
+  if (has_residual) {
+    at::Tensor grad_residual_base;
+    if (prenorm) {
+      grad_residual_base = grad_norm_input;
+    } else {
+      grad_residual_base = grad_pre_out;
+    }
+    grad_residual_result = grad_residual_base.to(residual.value().scalar_type());
+  }
+
+  auto grad_weight_result =
+      grad_weight_compute.to(weight.scalar_type());
+
+  at::Tensor grad_bias_result;
+  if (has_bias) {
+    grad_bias_result = grad_bias_compute.to(bias.value().scalar_type());
+  }
+
+  return std::make_tuple(grad_x_result, grad_weight_result, grad_bias_result,
+                         grad_residual_result);
 }
 
 }  // namespace cpu
