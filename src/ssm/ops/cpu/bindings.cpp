@@ -78,6 +78,13 @@ at::Tensor fused_layer_norm_cpu(
     const c10::optional<at::Tensor>& residual, bool is_rms, double eps,
     bool prenorm, bool residual_in_fp32);
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+fused_layer_norm_backward_cpu(
+    const at::Tensor& grad_output, const at::Tensor& x,
+    const at::Tensor& weight, const c10::optional<at::Tensor>& bias,
+    const c10::optional<at::Tensor>& residual, bool is_rms, double eps,
+    bool prenorm, bool residual_in_fp32);
+
 }  // namespace cpu
 }  // namespace ssm
 
@@ -132,6 +139,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("bias") = c10::nullopt, py::arg("residual") = c10::nullopt,
         py::arg("is_rms") = false, py::arg("eps") = 1e-5,
         py::arg("prenorm") = true, py::arg("residual_in_fp32") = true);
+  m.def("fused_layer_norm_backward",
+        &ssm::cpu::fused_layer_norm_backward_cpu,
+        "Fused LayerNorm/RMSNorm backward (CPU)", py::arg("grad_output"),
+        py::arg("x"), py::arg("weight"), py::arg("bias") = c10::nullopt,
+        py::arg("residual") = c10::nullopt, py::arg("is_rms") = false,
+        py::arg("eps") = 1e-5, py::arg("prenorm") = true,
+        py::arg("residual_in_fp32") = true);
 }
 
 TORCH_LIBRARY(ssm, m) {
@@ -165,6 +179,13 @@ TORCH_LIBRARY(ssm, m) {
       "dw_causal_conv_backward(Tensor grad_output, Tensor x, Tensor weight,"
       " Tensor? bias=None, str activation='silu')"
       " -> (Tensor, Tensor, Tensor?)");
+  m.def("fused_layer_norm(Tensor x, Tensor weight, Tensor? bias=None, Tensor?"
+        " residual=None, bool is_rms=False, float eps=1e-5, bool prenorm=True,"
+        " bool residual_in_fp32=True) -> Tensor");
+  m.def("fused_layer_norm_backward(Tensor grad_output, Tensor x, Tensor weight,"
+        " Tensor? bias=None, Tensor? residual=None, bool is_rms=False,"
+        " float eps=1e-5, bool prenorm=True, bool residual_in_fp32=True)"
+        " -> (Tensor, Tensor, Tensor?, Tensor?)");
 }
 
 TORCH_LIBRARY_IMPL(ssm, CPU, m) {
@@ -177,5 +198,7 @@ TORCH_LIBRARY_IMPL(ssm, CPU, m) {
   m.impl("ssd_chunk_scan_backward", ssm::cpu::ssd_chunk_scan_backward_cpu);
   m.impl("dw_causal_conv", ssm::cpu::dw_causal_conv_cpu);
   m.impl("dw_causal_conv_backward", ssm::cpu::dw_causal_conv_backward_cpu);
+  m.impl("fused_layer_norm", ssm::cpu::fused_layer_norm_cpu);
+  m.impl("fused_layer_norm_backward", ssm::cpu::fused_layer_norm_backward_cpu);
 }
 
