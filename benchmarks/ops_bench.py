@@ -201,7 +201,7 @@ def _autograd_targets(
 
 
 def _ensure_tensor(
-    output: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    output: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
 ) -> torch.Tensor:
     if isinstance(output, tuple):
         return output[0]
@@ -671,6 +671,13 @@ def _build_state_step_runners(
         else:
             raise ValueError(f"unknown backend {backend}")
 
+        backend_grad_keys = grad_keys
+        backend_clone_keys: tuple[str, ...] = ("state",)
+        if backend == "python":
+            backend_grad_keys = tuple(
+                name for name in backend_grad_keys if name != "state"
+            )
+
         if mode == "forward":
 
             def run_forward() -> None:
@@ -682,11 +689,13 @@ def _build_state_step_runners(
 
         def run_backward() -> None:
             prepared = _prepare_autograd_inputs(
-                inputs, grad_keys=grad_keys, clone_keys=("state",)
+                inputs,
+                grad_keys=backend_grad_keys,
+                clone_keys=backend_clone_keys,
             )
             output = call(prepared)
             loss = output.sum()
-            targets = _autograd_targets(prepared, grad_keys)
+            targets = _autograd_targets(prepared, backend_grad_keys)
             if targets:
                 torch.autograd.grad(loss, targets, allow_unused=True)
 
