@@ -41,4 +41,4 @@ testpaths = [
 ]
 
 [tool.ruff]
-exclude = ["reference_mamba"]
+exclude = ["reference_mamba", "external"]

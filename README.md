@@ -13,6 +13,33 @@ Quick start
 - Run tests (API/contract only): `pytest -q`
 - Run golden tests: `pytest -q --run-goldens` (placeholders until replaced)
 
+### CUDA parity goldens
+
+The CUDA parity suite compares local kernels against tensors generated with the
+official Mamba CUDA implementation. To refresh the fixtures on a GPU machine:
+
+1. Clone the upstream repository next to this project and pin the commit::
+
+       git clone https://github.com/state-spaces/mamba.git external/mamba_upstream
+       (cd external/mamba_upstream && git checkout 10b5d6358f27966f6a40e4bf0baa17a460688128)
+
+   Building the upstream CUDA extensions requires a CUDA toolkit with `nvcc`
+   available. If your environment lacks a full toolkit, regenerate the fixtures
+   on a development workstation or GPU runner that provides it.
+
+2. Regenerate the serialized tensors with the upstream backend::
+
+       python scripts/refresh_mamba_goldens.py \
+           --mamba-repo external/mamba_upstream \
+           --device cuda:0 \
+           --output tests/mamba_reference_cases.json
+
+   The script captures deterministic forwards and gradients across the CUDA
+   kernels and writes a single JSON file that the parity tests consume when it
+   is present. Drop the generated `tests/mamba_reference_cases.json` into your
+   local checkout before running the CUDA parity suite. The path is git-ignored,
+   so you can regenerate as needed without touching version control.
+
 Benchmarks
 - Install optional dependencies: `python -m pip install -e .[bench]`
 - Compare Python vs. compiled kernels: `python -m benchmarks.ops_bench --device cpu --iters 1`

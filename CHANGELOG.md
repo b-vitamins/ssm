@@ -6,6 +6,22 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 ### Added
+- CUDA fused layer norm/RMSNorm backward kernel with autograd dispatch,
+  expanded golden fixtures for prenorm/postnorm and residual_in_fp32 variants,
+  and parity tests that exercise bias and residual gradients.
+- CUDA depthwise causal convolution backward kernel with activation-aware
+  gradient support, refreshed golden fixtures across layouts, and parity tests.
+- CUDA SSD chunk scan backward kernel covering ragged metadata, gating, and
+  initial-state propagation with refreshed CUDA goldens and parity tests.
+- CUDA selective state step backward kernel with optional projection/gating
+  support, autograd dispatch, and refreshed golden fixtures covering broadcast
+  and grouped parameter layouts.
+- CUDA selective scan backward kernel with grouped/time-varying parameter
+  support, autograd dispatch, and golden-backed parity tests.
+- Golden-backed CUDA parity tests that load serialized upstream outputs and
+  gradients for selective scan, selective state step, SSD chunk scan, depthwise
+  causal convolution, and fused layer norm, plus a regeneration script pinned to
+  the upstream Mamba commit for generating local JSON references.
 - CPU selective scan, selective state step, and SSD chunk scan backward kernels
   with autograd regression tests validating gradients against the reference
   implementation.
@@ -40,6 +56,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - CUDA kernels and bindings for selective scan, selective state step, SSD chunk scan, depthwise causal convolution, and fused layer norm with GPU-dispatch integration and CUDA-focused tests.
 - Stress tests that cover long sequences, high state dimensions, grouped parameters, and mixed-precision execution paths under `tests/stress/`.
 ### Changed
+- Consolidated the CUDA parity goldens behind `refresh_mamba_goldens.py`,
+  teaching the CUDA parity tests to stream data from `tests/mamba_reference_cases.json`
+  when present and otherwise skip with guidance to regenerate locally.
 - Replaced the CUDA fused layer norm with a block-reduction kernel mirroring
   the upstream implementation, covering RMSNorm/LayerNorm fusion, mixed
   precision, and residual-in-fp32 handling with new CUDA unit tests.

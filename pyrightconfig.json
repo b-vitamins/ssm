@@ -1,3 +1,4 @@
 {
-  "exclude": ["reference_mamba"]
+  "exclude": ["reference_mamba", "external"],
+  "extraPaths": ["src"]
 }
