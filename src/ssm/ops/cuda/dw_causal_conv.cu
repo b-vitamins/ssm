@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <tuple>
 #include <string>
 
 #ifndef USE_ROCM
@@ -532,6 +533,147 @@ at::Tensor dw_causal_conv_cuda_impl(const at::Tensor& x,
   return out;
 }
 
+template <typename input_t>
+__global__ void silu_backward_kernel(const input_t* preact, input_t* grad,
+                                     int64_t total) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= total) {
+    return;
+  }
+  float grad_val = static_cast<float>(grad[index]);
+  float pre_val = static_cast<float>(preact[index]);
+  float sigmoid = 1.0f / (1.0f + expf(-pre_val));
+  float derivative = sigmoid * (1.0f + pre_val * (1.0f - sigmoid));
+  grad[index] = static_cast<input_t>(grad_val * derivative);
+}
+
+template <typename input_t>
+__global__ void dw_causal_conv_backward_channels_first_kernel(
+    const input_t* grad_act, const input_t* x, const input_t* weight,
+    input_t* grad_x, float* grad_weight, float* grad_bias, int batch,
+    int channels, int seqlen, int width, bool accumulate_bias) {
+  constexpr int kMaxWidth = 4;
+  int batch_id = blockIdx.x;
+  int channel_id = blockIdx.y;
+  int thread_id = threadIdx.x;
+  int stride = blockDim.x;
+
+  if (batch_id >= batch || channel_id >= channels) {
+    return;
+  }
+
+  const int64_t base =
+      (static_cast<int64_t>(batch_id) * channels + channel_id) * seqlen;
+  const input_t* grad_ptr = grad_act + base;
+  const input_t* x_ptr = x + base;
+  input_t* grad_x_ptr = grad_x + base;
+  const input_t* weight_ptr = weight + static_cast<int64_t>(channel_id) * width;
+
+  float local_weight[kMaxWidth] = {0.f, 0.f, 0.f, 0.f};
+  float local_bias = 0.f;
+
+  for (int idx = thread_id; idx < seqlen; idx += stride) {
+    float grad_val = static_cast<float>(grad_ptr[idx]);
+    if (accumulate_bias) {
+      local_bias += grad_val;
+    }
+
+    float grad_x_val = 0.f;
+    for (int k = 0; k < width; ++k) {
+      int grad_offset = idx + k;
+      if (grad_offset < seqlen) {
+        grad_x_val += static_cast<float>(grad_ptr[grad_offset]) *
+                      static_cast<float>(weight_ptr[k]);
+      }
+      int x_offset = idx - k;
+      if (x_offset >= 0) {
+        local_weight[k] +=
+            grad_val * static_cast<float>(x_ptr[x_offset]);
+      }
+    }
+    grad_x_ptr[idx] = static_cast<input_t>(grad_x_val);
+  }
+
+  __syncthreads();
+
+  for (int k = 0; k < width; ++k) {
+    if (local_weight[k] != 0.f) {
+      atomicAdd(&grad_weight[channel_id * width + k], local_weight[k]);
+    }
+  }
+
+  if (accumulate_bias && local_bias != 0.f) {
+    atomicAdd(&grad_bias[channel_id], local_bias);
+  }
+}
+
+template <typename input_t>
+std::tuple<at::Tensor, at::Tensor, c10::optional<at::Tensor>>
+dw_causal_conv_backward_cuda_impl(const at::Tensor& grad_output_cf,
+                                  const at::Tensor& x_cf,
+                                  const at::Tensor& weight_cf,
+                                  const c10::optional<at::Tensor>& bias,
+                                  bool silu_activation) {
+  TORCH_CHECK(grad_output_cf.is_contiguous(),
+              "grad_output must be contiguous");
+  TORCH_CHECK(x_cf.is_contiguous(), "x must be contiguous");
+  TORCH_CHECK(weight_cf.is_contiguous(), "weight must be contiguous");
+
+  const auto batch = static_cast<int>(x_cf.size(0));
+  const auto channels = static_cast<int>(x_cf.size(1));
+  const auto seqlen = static_cast<int>(x_cf.size(2));
+  const auto width = static_cast<int>(weight_cf.size(2));
+
+  auto stream = c10::cuda::getCurrentCUDAStream();
+
+  at::Tensor grad_act = grad_output_cf.clone();
+  if (silu_activation) {
+    auto preact = dw_causal_conv_cuda_impl<input_t>(
+        x_cf, weight_cf, bias, /*channels_first=*/true,
+        /*silu_activation=*/false);
+    const int64_t total = grad_act.numel();
+    const int threads = 256;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    silu_backward_kernel<input_t><<<blocks, threads, 0, stream>>>(
+        preact.data_ptr<input_t>(), grad_act.data_ptr<input_t>(), total);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  auto grad_x = at::empty_like(x_cf);
+  auto weight_view = weight_cf.view({channels, width});
+  auto grad_weight_accum = at::zeros(
+      {channels, width}, grad_act.options().dtype(at::kFloat));
+  float* grad_bias_ptr = nullptr;
+  at::Tensor grad_bias_accum;
+  const bool has_bias = bias.has_value();
+  if (has_bias) {
+    grad_bias_accum =
+        at::zeros({channels}, grad_act.options().dtype(at::kFloat));
+    grad_bias_ptr = grad_bias_accum.data_ptr<float>();
+  }
+
+  dim3 grid(batch, channels, 1);
+  const int threads = 128;
+  dw_causal_conv_backward_channels_first_kernel<input_t>
+      <<<grid, threads, 0, stream>>>(grad_act.data_ptr<input_t>(),
+                                     x_cf.data_ptr<input_t>(),
+                                     weight_view.data_ptr<input_t>(),
+                                     grad_x.data_ptr<input_t>(),
+                                     grad_weight_accum.data_ptr<float>(),
+                                     grad_bias_ptr, batch, channels, seqlen,
+                                     width, has_bias);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto grad_weight = grad_weight_accum.to(weight_cf.scalar_type())
+                         .view_as(weight_cf);
+  c10::optional<at::Tensor> grad_bias_opt = c10::nullopt;
+  if (has_bias) {
+    grad_bias_opt = grad_bias_accum.to(weight_cf.scalar_type());
+  }
+
+  return std::make_tuple(grad_x, grad_weight, grad_bias_opt);
+}
+
 at::Tensor dw_causal_conv_fallback(const at::Tensor& x,
                                    const at::Tensor& weight,
                                    const c10::optional<at::Tensor>& bias,
@@ -712,6 +854,114 @@ at::Tensor dw_causal_conv_cuda(const at::Tensor& x, const at::Tensor& weight,
   }
 
   return result;
+}
+
+std::tuple<at::Tensor, at::Tensor, c10::optional<at::Tensor>>
+dw_causal_conv_backward_cuda(const at::Tensor& grad_output,
+                             const at::Tensor& x,
+                             const at::Tensor& weight,
+                             const c10::optional<at::Tensor>& bias,
+                             const std::string& activation) {
+  TORCH_CHECK(grad_output.is_cuda(),
+              "grad_output must be a CUDA tensor.");
+  TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor.");
+  TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor.");
+  if (bias.has_value()) {
+    TORCH_CHECK(bias->is_cuda(), "bias must be a CUDA tensor.");
+  }
+
+  TORCH_CHECK(x.dim() == 3, "x must have shape (B, C, L) or (B, L, C).");
+  TORCH_CHECK(grad_output.sizes() == x.sizes(),
+              "grad_output must have the same shape as x.");
+
+  if (!is_supported_activation(activation)) {
+    TORCH_CHECK(false,
+                "Unsupported activation '" + activation +
+                    "' for CUDA depthwise causal conv backward.");
+  }
+
+  bool channels_first = false;
+  int64_t channels = 0;
+  if (x.size(1) == weight.size(0)) {
+    channels_first = true;
+    channels = x.size(1);
+  } else if (x.size(2) == weight.size(0)) {
+    channels_first = false;
+    channels = x.size(2);
+  } else {
+    TORCH_CHECK(false, "weight channel dimension must match x.");
+  }
+
+  auto weight_3d = weight.dim() == 2 ? weight.unsqueeze(1) : weight;
+  TORCH_CHECK(weight_3d.size(0) == channels && weight_3d.size(1) == 1,
+              "Expected depthwise weights with shape (C, 1, K).");
+
+  if (bias.has_value()) {
+    const auto& bias_tensor = bias.value();
+    TORCH_CHECK(bias_tensor.dim() == 1 && bias_tensor.size(0) == channels,
+                "bias must have shape (C,).");
+  }
+
+  const auto dtype = x.scalar_type();
+  TORCH_CHECK(dtype == at::kFloat || dtype == at::kHalf ||
+                  dtype == at::kBFloat16,
+              "Unsupported dtype for CUDA depthwise causal conv backward.");
+  TORCH_CHECK(weight_3d.scalar_type() == dtype,
+              "weight must match x dtype for CUDA depthwise causal conv backward.");
+  if (bias.has_value()) {
+    TORCH_CHECK(bias->scalar_type() == dtype,
+                "bias must match x dtype for CUDA depthwise causal conv backward.");
+  }
+
+  const int64_t kernel_size = weight_3d.size(2);
+  TORCH_CHECK(2 <= kernel_size && kernel_size <= 4,
+              "Unsupported kernel size for CUDA depthwise causal conv backward.");
+
+  auto grad_out_contig = grad_output.contiguous();
+  auto x_cf = channels_first ? x.contiguous() : x.permute({0, 2, 1}).contiguous();
+  auto grad_cf = channels_first ? grad_out_contig
+                                : grad_out_contig.permute({0, 2, 1}).contiguous();
+  auto weight_cf = weight_3d.contiguous();
+  c10::optional<at::Tensor> bias_cf = c10::nullopt;
+  if (bias.has_value()) {
+    bias_cf = bias->contiguous();
+  }
+
+  c10::cuda::CUDAGuard guard(x.device());
+  bool silu_activation = use_silu(activation);
+
+  std::tuple<at::Tensor, at::Tensor, c10::optional<at::Tensor>> grads;
+  if (dtype == at::kFloat) {
+    grads = dw_causal_conv_backward_cuda_impl<float>(grad_cf, x_cf, weight_cf,
+                                                     bias_cf, silu_activation);
+  } else if (dtype == at::kHalf) {
+    grads = dw_causal_conv_backward_cuda_impl<at::Half>(
+        grad_cf, x_cf, weight_cf, bias_cf, silu_activation);
+  } else {
+    grads = dw_causal_conv_backward_cuda_impl<at::BFloat16>(
+        grad_cf, x_cf, weight_cf, bias_cf, silu_activation);
+  }
+
+  at::Tensor grad_x_cf;
+  at::Tensor grad_weight_cf;
+  c10::optional<at::Tensor> grad_bias_cf;
+  std::tie(grad_x_cf, grad_weight_cf, grad_bias_cf) = grads;
+
+  at::Tensor grad_x = channels_first
+                          ? grad_x_cf
+                          : grad_x_cf.permute({0, 2, 1}).contiguous();
+
+  at::Tensor grad_weight = weight.dim() == 2 ? grad_weight_cf.squeeze(1)
+                                             : grad_weight_cf;
+
+  c10::optional<at::Tensor> grad_bias = c10::nullopt;
+  if (bias.has_value()) {
+    TORCH_CHECK(grad_bias_cf.has_value(),
+                "Bias gradients were not produced by CUDA backward kernel.");
+    grad_bias = grad_bias_cf->view(bias->sizes());
+  }
+
+  return std::make_tuple(grad_x, grad_weight, grad_bias);
 }
 
 }  // namespace cuda

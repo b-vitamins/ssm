@@ -314,7 +314,7 @@ class _SelectiveScanCudaFunction(torch.autograd.Function):
                 return None
             return tensor if tensor.is_contiguous() else tensor.contiguous()
 
-        output, last_state = _invoke_cuda(
+        output, last_state, cache = _invoke_cuda(
             ops.selective_scan,
             _maybe_contiguous(u),
             _maybe_contiguous(delta),
@@ -332,6 +332,8 @@ class _SelectiveScanCudaFunction(torch.autograd.Function):
         ctx.z = z
         ctx.dt_bias = dt_bias
         ctx.softplus = softplus
+        ctx.forward_output = output.detach()
+        ctx.cache = cache.detach()
         ctx.input_requires_grad = (
             u.requires_grad,
             delta.requires_grad,
@@ -360,75 +362,113 @@ class _SelectiveScanCudaFunction(torch.autograd.Function):
         softplus: bool = ctx.softplus
         req = ctx.input_requires_grad
 
-        with torch.enable_grad():
-            u_ref = u.detach().clone().requires_grad_(req[0])
-            delta_ref = delta.detach().clone().requires_grad_(req[1])
-            A_ref = A.detach().clone().requires_grad_(req[2])
-            B_ref = B.detach().clone().requires_grad_(req[3])
-            C_ref = C.detach().clone().requires_grad_(req[4])
-            D_ref = D.detach().clone().requires_grad_(req[5]) if D is not None else None
-            z_ref = z.detach().clone().requires_grad_(req[6]) if z is not None else None
-            dt_bias_ref = (
-                dt_bias.detach().clone().requires_grad_(req[7])
-                if dt_bias is not None
-                else None
-            )
-
-            out_ref, last_state_ref = reference_ops.selective_scan(
-                u_ref,
-                delta_ref,
-                A_ref,
-                B_ref,
-                C_ref,
-                D=D_ref,
-                z=z_ref,
-                dt_bias=dt_bias_ref,
-                softplus=softplus,
-                return_last_state=True,
-            )
-
-            grad_out = (
-                grad_output if grad_output is not None else torch.zeros_like(out_ref)
-            )
-            grad_last = (
-                grad_last_state
-                if grad_last_state is not None
-                else torch.zeros_like(last_state_ref)
-            )
-
-            inputs: list[torch.Tensor] = []
-            mapping: list[int] = []
-            candidates = [
-                u_ref,
-                delta_ref,
-                A_ref,
-                B_ref,
-                C_ref,
-                D_ref,
-                z_ref,
-                dt_bias_ref,
-            ]
-            for idx, tensor in enumerate(candidates):
-                if tensor is not None and tensor.requires_grad:
-                    inputs.append(tensor)
-                    mapping.append(idx)
-
-            grads: tuple[torch.Tensor, ...]
-            if inputs:
-                grads = torch.autograd.grad(
-                    outputs=(out_ref, last_state_ref),
-                    inputs=inputs,
-                    grad_outputs=(grad_out, grad_last),
-                    allow_unused=True,
+        if grad_last_state is not None:
+            with torch.enable_grad():
+                u_ref = u.detach().clone().requires_grad_(req[0])
+                delta_ref = delta.detach().clone().requires_grad_(req[1])
+                A_ref = A.detach().clone().requires_grad_(req[2])
+                B_ref = B.detach().clone().requires_grad_(req[3])
+                C_ref = C.detach().clone().requires_grad_(req[4])
+                D_ref = (
+                    D.detach().clone().requires_grad_(req[5]) if D is not None else None
                 )
+                z_ref = (
+                    z.detach().clone().requires_grad_(req[6]) if z is not None else None
+                )
+                dt_bias_ref = (
+                    dt_bias.detach().clone().requires_grad_(req[7])
+                    if dt_bias is not None
+                    else None
+                )
+
+                out_ref, last_state_ref = reference_ops.selective_scan(
+                    u_ref,
+                    delta_ref,
+                    A_ref,
+                    B_ref,
+                    C_ref,
+                    D=D_ref,
+                    z=z_ref,
+                    dt_bias=dt_bias_ref,
+                    softplus=softplus,
+                    return_last_state=True,
+                )
+
+                grad_out = (
+                    grad_output
+                    if grad_output is not None
+                    else torch.zeros_like(out_ref)
+                )
+                grad_last = grad_last_state
+
+                inputs: list[torch.Tensor] = []
+                mapping: list[int] = []
+                candidates = [
+                    u_ref,
+                    delta_ref,
+                    A_ref,
+                    B_ref,
+                    C_ref,
+                    D_ref,
+                    z_ref,
+                    dt_bias_ref,
+                ]
+                for idx, tensor in enumerate(candidates):
+                    if tensor is not None and tensor.requires_grad:
+                        inputs.append(tensor)
+                        mapping.append(idx)
+
+                grads: tuple[torch.Tensor, ...]
+                if inputs:
+                    grads = torch.autograd.grad(
+                        outputs=(out_ref, last_state_ref),
+                        inputs=inputs,
+                        grad_outputs=(grad_out, grad_last),
+                        allow_unused=True,
+                    )
+                else:
+                    grads = tuple()
+
+            result: list[Optional[torch.Tensor]] = [None] * 8
+            for idx, grad in zip(mapping, grads):
+                result[idx] = grad
+
+            return (None, *result, None)
+
+        ops = _load_cuda_ops()
+        assert ops is not None
+
+        grad_out_tensor = (
+            grad_output.contiguous()
+            if grad_output is not None
+            else torch.zeros_like(ctx.forward_output)
+        )
+
+        grads = _invoke_cuda(
+            ops.selective_scan_backward,
+            grad_out_tensor,
+            grad_last_state,
+            u,
+            delta,
+            A,
+            B,
+            C,
+            D,
+            z,
+            dt_bias,
+            softplus,
+            ctx.forward_output,
+            ctx.cache,
+        )
+
+        grad_tensors: list[Optional[torch.Tensor]] = []
+        for flag, grad in zip(req, grads):
+            if not flag or grad is None:
+                grad_tensors.append(None)
             else:
-                grads = tuple()
+                grad_tensors.append(grad)
 
-        result: list[Optional[torch.Tensor]] = [None] * 8
-        for idx, grad in zip(mapping, grads):
-            result[idx] = grad
-
-        return (None, *result, None)
+        return (None, *grad_tensors, None)
 
 
 class _SelectiveStateStepFunction(torch.autograd.Function):
@@ -589,6 +629,9 @@ class _SelectiveStateStepCudaFunction(torch.autograd.Function):
         grad_output: Optional[torch.Tensor],
         grad_state: Optional[torch.Tensor],
     ) -> tuple[Optional[torch.Tensor], ...]:
+        ops = _load_cuda_ops()
+        assert ops is not None
+
         state_saved, x, dt, A, B, C = ctx.saved_tensors
         D: Optional[torch.Tensor] = ctx.D
         z: Optional[torch.Tensor] = ctx.z
@@ -596,79 +639,41 @@ class _SelectiveStateStepCudaFunction(torch.autograd.Function):
         softplus: bool = ctx.softplus
         req = ctx.input_requires_grad
 
-        with torch.enable_grad():
-            state_ref = state_saved.detach().clone().requires_grad_(req[0])
-            x_ref = x.detach().clone().requires_grad_(req[1])
-            dt_ref = dt.detach().clone().requires_grad_(req[2])
-            A_ref = A.detach().clone().requires_grad_(req[3])
-            B_ref = B.detach().clone().requires_grad_(req[4])
-            C_ref = C.detach().clone().requires_grad_(req[5])
-            D_ref = D.detach().clone().requires_grad_(req[6]) if D is not None else None
-            z_ref = z.detach().clone().requires_grad_(req[7]) if z is not None else None
-            dt_bias_ref = (
-                dt_bias.detach().clone().requires_grad_(req[8])
-                if dt_bias is not None
-                else None
-            )
+        def _maybe_contiguous(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            return tensor if tensor.is_contiguous() else tensor.contiguous()
 
-            out_ref, new_state_ref = _state_step_reference_no_inplace(
-                state_ref,
-                x_ref,
-                dt_ref,
-                A_ref,
-                B_ref,
-                C_ref,
-                D_ref,
-                z_ref,
-                dt_bias_ref,
-                softplus,
-            )
+        grad_out = (
+            grad_output
+            if grad_output is not None
+            else torch.zeros_like(x, memory_format=torch.preserve_format)
+        )
 
-            grad_out = (
-                grad_output.to(out_ref.dtype)
-                if grad_output is not None
-                else torch.zeros_like(out_ref)
-            )
-            grad_state_ref = (
-                grad_state.to(new_state_ref.dtype)
-                if grad_state is not None
-                else torch.zeros_like(new_state_ref)
-            )
+        backward_results = _invoke_cuda(
+            ops.selective_state_step_backward,
+            grad_out if grad_out.is_contiguous() else grad_out.contiguous(),
+            _maybe_contiguous(grad_state),
+            state_saved if state_saved.is_contiguous() else state_saved.contiguous(),
+            x if x.is_contiguous() else x.contiguous(),
+            dt if dt.is_contiguous() else dt.contiguous(),
+            A,
+            _maybe_contiguous(B),
+            _maybe_contiguous(C),
+            _maybe_contiguous(D),
+            _maybe_contiguous(z),
+            _maybe_contiguous(dt_bias),
+            softplus,
+        )
 
-            inputs: list[torch.Tensor] = []
-            mapping: list[int] = []
-            candidates = [
-                state_ref,
-                x_ref,
-                dt_ref,
-                A_ref,
-                B_ref,
-                C_ref,
-                D_ref,
-                z_ref,
-                dt_bias_ref,
-            ]
-            for idx, tensor in enumerate(candidates):
-                if tensor is not None and tensor.requires_grad:
-                    inputs.append(tensor)
-                    mapping.append(idx)
-
-            grads: tuple[torch.Tensor, ...]
-            if inputs:
-                grads = torch.autograd.grad(
-                    outputs=(out_ref, new_state_ref),
-                    inputs=inputs,
-                    grad_outputs=(grad_out, grad_state_ref),
-                    allow_unused=True,
-                )
+        grads: list[Optional[torch.Tensor]] = []
+        for grad, needed in zip(backward_results, req):
+            if not needed:
+                grads.append(None)
             else:
-                grads = tuple()
+                grads.append(grad)
 
-        result: list[Optional[torch.Tensor]] = [None] * 9
-        for idx, grad in zip(mapping, grads):
-            result[idx] = grad
-
-        return (*result, None)
+        return (*grads, None)
 
 
 class _SSDChunkScanFunction(torch.autograd.Function):
@@ -846,68 +851,40 @@ class _SSDChunkScanCudaFunction(torch.autograd.Function):
         chunk_size: int = ctx.chunk_size
         req = ctx.input_requires_grad
 
-        with torch.enable_grad():
-            X_ref = X.detach().clone().requires_grad_(req[0])
-            dt_ref = dt.detach().clone().requires_grad_(req[1])
-            A_ref = A.detach().clone().requires_grad_(req[2])
-            B_ref = B.detach().clone().requires_grad_(req[3])
-            C_ref = C.detach().clone().requires_grad_(req[4])
-            D_ref = D.detach().clone().requires_grad_(req[5]) if D is not None else None
-            z_ref = z.detach().clone().requires_grad_(req[6]) if z is not None else None
-            init_ref = (
-                initial_states.detach().clone().requires_grad_(req[7])
-                if initial_states is not None
-                else None
-            )
+        ops = _load_cuda_ops()
+        assert ops is not None
 
-            out_ref = reference_ops.ssd_chunk_scan(
-                X_ref,
-                dt_ref,
-                A_ref,
-                B_ref,
-                C_ref,
-                chunk_size,
-                D=D_ref,
-                z=z_ref,
-                seq_meta=seq_meta,
-                initial_states=init_ref,
-            )
+        def _maybe_contiguous(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            return tensor if tensor.is_contiguous() else tensor.contiguous()
 
-            grad_out = (
-                grad_output if grad_output is not None else torch.zeros_like(out_ref)
-            )
+        grad_out_tensor = (
+            grad_output.contiguous() if grad_output is not None else torch.zeros_like(X)
+        )
 
-            inputs: list[torch.Tensor] = []
-            mapping: list[int] = []
-            candidates = [
-                X_ref,
-                dt_ref,
-                A_ref,
-                B_ref,
-                C_ref,
-                D_ref,
-                z_ref,
-                init_ref,
-            ]
-            for idx, tensor in enumerate(candidates):
-                if tensor is not None and tensor.requires_grad:
-                    inputs.append(tensor)
-                    mapping.append(idx)
+        seq_lens_tensor, cu_seqlens_tensor = _prepare_seq_meta(seq_meta, X.device)
 
-            grads: tuple[torch.Tensor, ...]
-            if inputs:
-                grads = torch.autograd.grad(
-                    outputs=out_ref,
-                    inputs=inputs,
-                    grad_outputs=grad_out,
-                    allow_unused=True,
-                )
-            else:
-                grads = tuple()
+        grads = _invoke_cuda(
+            ops.ssd_chunk_scan_backward,
+            grad_out_tensor,
+            _maybe_contiguous(X),
+            _maybe_contiguous(dt),
+            _maybe_contiguous(A),
+            _maybe_contiguous(B),
+            _maybe_contiguous(C),
+            chunk_size,
+            _maybe_contiguous(D),
+            _maybe_contiguous(z),
+            seq_lens_tensor,
+            cu_seqlens_tensor,
+            _maybe_contiguous(initial_states),
+        )
 
         result: list[Optional[torch.Tensor]] = [None] * 8
-        for idx, grad in zip(mapping, grads):
-            result[idx] = grad
+        for idx, (flag, grad) in enumerate(zip(req, grads)):
+            if flag and grad is not None:
+                result[idx] = grad
 
         return (
             result[0],
@@ -915,10 +892,10 @@ class _SSDChunkScanCudaFunction(torch.autograd.Function):
             result[2],
             result[3],
             result[4],
-            None,  # chunk_size
+            None,
             result[5],
             result[6],
-            None,  # seq_meta
+            None,
             result[7],
         )
 
@@ -1026,48 +1003,33 @@ class _DwCausalConvCudaFunction(torch.autograd.Function):
         has_bias: bool = ctx.has_bias
         req = ctx.input_requires_grad
 
-        with torch.enable_grad():
-            x_ref = x.detach().clone().requires_grad_(req[0])
-            weight_ref = weight.detach().clone().requires_grad_(req[1])
-            bias_ref = (
-                bias_tensor.detach().clone().requires_grad_(req[2])
-                if has_bias
-                else None
-            )
+        grad_out = grad_output if grad_output is not None else torch.zeros_like(x)
 
-            out_ref = reference_ops.dw_causal_conv(
-                x_ref,
-                weight_ref,
-                bias=bias_ref,
-                activation=activation,
-            )
+        ops = _load_cuda_ops()
+        assert ops is not None
 
-            grad_out = (
-                grad_output if grad_output is not None else torch.zeros_like(out_ref)
-            )
+        def _maybe_contiguous(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            return tensor if tensor.is_contiguous() else tensor.contiguous()
 
-            inputs: list[torch.Tensor] = []
-            mapping: list[int] = []
-            candidates = [x_ref, weight_ref, bias_ref]
-            for idx, tensor in enumerate(candidates):
-                if tensor is not None and tensor.requires_grad:
-                    inputs.append(tensor)
-                    mapping.append(idx)
+        bias_arg = bias_tensor if has_bias else None
+        grad_x, grad_weight, grad_bias = _invoke_cuda(
+            ops.dw_causal_conv_backward,
+            _maybe_contiguous(grad_out),
+            _maybe_contiguous(x),
+            _maybe_contiguous(weight),
+            _maybe_contiguous(bias_arg),
+            activation,
+        )
 
-            grads: tuple[torch.Tensor, ...]
-            if inputs:
-                grads = torch.autograd.grad(
-                    outputs=out_ref,
-                    inputs=inputs,
-                    grad_outputs=grad_out,
-                    allow_unused=True,
-                )
-            else:
-                grads = tuple()
-
-        result: list[Optional[torch.Tensor]] = [None] * 3
-        for idx, grad in zip(mapping, grads):
-            result[idx] = grad
+        result: list[Optional[torch.Tensor]] = [None, None, None]
+        if req[0]:
+            result[0] = grad_x
+        if req[1]:
+            result[1] = grad_weight
+        if has_bias and req[2]:
+            result[2] = grad_bias
 
         return (*result, None)
 
@@ -1226,60 +1188,40 @@ class _FusedLayerNormCudaFunction(torch.autograd.Function):
         x, weight, bias_tensor, residual_tensor = ctx.saved_tensors
         is_rms, eps, prenorm, residual_in_fp32, has_bias, has_residual = ctx.flags
         req = ctx.input_requires_grad
+        ops = _load_cuda_ops()
+        assert ops is not None
 
-        with torch.enable_grad():
-            x_ref = x.detach().clone().requires_grad_(req[0])
-            weight_ref = weight.detach().clone().requires_grad_(req[1])
-            bias_ref = (
-                bias_tensor.detach().clone().requires_grad_(req[2])
-                if has_bias
-                else None
-            )
-            residual_ref = (
-                residual_tensor.detach().clone().requires_grad_(req[3])
-                if has_residual
-                else None
-            )
+        def _maybe_contiguous(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            return tensor if tensor.is_contiguous() else tensor.contiguous()
 
-            out_ref = reference_ops.fused_layer_norm(
-                x_ref,
-                weight_ref,
-                bias_ref,
-                residual=residual_ref,
-                is_rms=is_rms,
-                eps=eps,
-                prenorm=prenorm,
-                residual_in_fp32=residual_in_fp32,
-            )
+        grad_out = grad_output if grad_output is not None else torch.zeros_like(x)
 
-            grad_out = (
-                grad_output if grad_output is not None else torch.zeros_like(out_ref)
-            )
+        bias_arg = bias_tensor if has_bias else None
+        residual_arg = residual_tensor if has_residual else None
 
-            inputs: list[torch.Tensor] = []
-            mapping: list[int] = []
-            candidates = [x_ref, weight_ref, bias_ref, residual_ref]
-            for idx, tensor in enumerate(candidates):
-                if tensor is not None and tensor.requires_grad:
-                    inputs.append(tensor)
-                    mapping.append(idx)
+        grads = _invoke_cuda(
+            ops.fused_layer_norm_backward,
+            _maybe_contiguous(grad_out),
+            _maybe_contiguous(x),
+            _maybe_contiguous(weight),
+            _maybe_contiguous(bias_arg),
+            _maybe_contiguous(residual_arg),
+            is_rms,
+            eps,
+            prenorm,
+            residual_in_fp32,
+        )
 
-            grads: tuple[torch.Tensor, ...]
-            if inputs:
-                grads = torch.autograd.grad(
-                    outputs=out_ref,
-                    inputs=inputs,
-                    grad_outputs=grad_out,
-                    allow_unused=True,
-                )
+        grad_tensors: list[Optional[torch.Tensor]] = []
+        for flag, grad in zip(req, grads):
+            if not flag or grad is None:
+                grad_tensors.append(None)
             else:
-                grads = tuple()
+                grad_tensors.append(grad)
 
-        result: list[Optional[torch.Tensor]] = [None] * 4
-        for idx, grad in zip(mapping, grads):
-            result[idx] = grad
-
-        return (*result, None, None, None, None)
+        return (*grad_tensors, None, None, None, None)
 
 
 def _cpu_backend_status() -> _BackendCandidate:
