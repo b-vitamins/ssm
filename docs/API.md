@@ -35,9 +35,11 @@ class Mamba1(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
+        dt_rank: int | str = "auto",
         dt_min: float = 1e-3,
         dt_max: float = 1e-1,
         dt_init_floor: float = 1e-4,
+        dt_init: str = "random",
         bias: bool = False,
         conv_bias: bool = True,
         use_fast_path: bool = True,
@@ -61,6 +63,10 @@ class Mamba1(nn.Module):
 Contract
 - Inputs: `hidden_states` shape `(B, L, D)` matching `d_model`.
 - Outputs: tensor shape `(B, L, D)`.
+- `dt_rank` mirrors the upstream low-rank time-step projection. Accepts integers or
+  the string ``"auto"`` (mapped to ``ceil(d_model / 16)``).
+- ``dt_min``, ``dt_max``, ``dt_init_floor``, and ``dt_init`` control the softplus
+  bias initialisation schedule for the continuous-time step sizes.
 - `allocate_inference_cache` returns `(conv_state, ssm_state)` sized for decoding; shapes defined in docstrings.
 - Forward may raise `NotImplementedError` until kernels exist.
 
@@ -157,6 +163,12 @@ class MambaConfig:
     pad_vocab_size_multiple: int = 8
     tie_embeddings: bool = True
 ```
+
+``ssm_cfg`` defaults to a Mamba1 configuration exposing ``dt_rank`` and the
+softplus initialisation schedule (``dt_min=1e-3``, ``dt_max=1e-1``,
+``dt_init_floor=1e-4``, ``dt_init="random"``). Override the dictionary to
+select alternative ranks, adjust the bias schedule, or switch to
+``{"layer": "Mamba2", ...}`` when constructing SSD-based models.
 
 ### ssm.utils.generation.InferenceParams
 ```python

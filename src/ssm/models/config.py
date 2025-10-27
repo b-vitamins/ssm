@@ -3,6 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+def _default_ssm_cfg() -> dict:
+    return {
+        "layer": "Mamba1",
+        "dt_rank": "auto",
+        "dt_min": 1e-3,
+        "dt_max": 1e-1,
+        "dt_init_floor": 1e-4,
+        "dt_init": "random",
+    }
+
+
 @dataclass
 class MambaConfig:
     """Configuration for Mamba-based language models.
@@ -28,7 +39,7 @@ class MambaConfig:
     d_intermediate: int = 0
     n_layer: int = 64
     vocab_size: int = 50277
-    ssm_cfg: dict = field(default_factory=dict)
+    ssm_cfg: dict = field(default_factory=_default_ssm_cfg)
     attn_layer_idx: list[int] = field(default_factory=list)
     attn_cfg: dict = field(default_factory=dict)
     rms_norm: bool = True

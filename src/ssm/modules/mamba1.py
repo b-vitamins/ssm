@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, cast
 
 import torch
@@ -17,17 +18,6 @@ def _compute_dtype(tensor: torch.Tensor) -> torch.dtype:
     return tensor.dtype
 
 
-def _linear_1x1(linear: nn.Linear, x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Apply a linear layer to channel-first inputs without extra transposes."""
-
-    weight = linear.weight.to(dtype)
-    bias = linear.bias.to(dtype) if linear.bias is not None else None
-    out = torch.einsum("oc,bcl->bol", weight, x)
-    if bias is not None:
-        out = out + bias.view(1, -1, 1)
-    return out
-
-
 class Mamba1(nn.Module):
     """Selective SSM (Mamba v1) block backed by the reference ops.
 
@@ -36,9 +26,12 @@ class Mamba1(nn.Module):
         d_state: State size used by the selective scan dynamics.
         d_conv: Depthwise convolution kernel width.
         expand: Multiplicative expansion factor for the intermediate channel count.
-        dt_min: Lower bound for the time-step initialization (kept for API parity).
-        dt_max: Upper bound for the time-step initialization (kept for API parity).
-        dt_init_floor: Floor value for the time-step initialization (kept for API parity).
+        dt_rank: Low-rank width for the time-step projection. ``"auto"`` follows the
+            upstream ``ceil(d_model / 16)`` heuristic.
+        dt_min: Lower bound when sampling the initial time-step bias.
+        dt_max: Upper bound when sampling the initial time-step bias.
+        dt_init_floor: Floor applied to the sampled bias to avoid vanishing steps.
+        dt_init: Weight initialisation policy for the low-rank time-step projection.
         bias: Whether to include bias terms on the linear projections.
         conv_bias: Whether to include bias terms on the convolution path.
         use_fast_path: Unused flag reserved for fused-kernel integration.
@@ -53,9 +46,11 @@ class Mamba1(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
+        dt_rank: int | str = "auto",
         dt_min: float = 1e-3,
         dt_max: float = 1e-1,
         dt_init_floor: float = 1e-4,
+        dt_init: str = "random",
         bias: bool = False,
         conv_bias: bool = True,
         use_fast_path: bool = True,
@@ -70,9 +65,14 @@ class Mamba1(nn.Module):
             d_state: State size used by the selective scan dynamics.
             d_conv: Depthwise convolution kernel width.
             expand: Multiplicative expansion factor for the intermediate channel count.
-            dt_min: Lower bound for the time-step initialization (kept for API parity).
-            dt_max: Upper bound for the time-step initialization (kept for API parity).
-            dt_init_floor: Floor value for the time-step initialization (kept for API parity).
+            dt_rank: Low-rank width used to parameterise the time-step projection. ``"auto"``
+                mirrors the upstream heuristic ``ceil(d_model / 16)``.
+            dt_min: Lower bound for sampling the initial time-step bias.
+            dt_max: Upper bound for sampling the initial time-step bias.
+            dt_init_floor: Floor value applied to the sampled time-step bias to avoid
+                vanishing updates.
+            dt_init: Strategy for initialising the time-step projection weights. Matches
+                the upstream options (``"random"`` or ``"constant"``).
             bias: Whether to include bias terms on the linear projections.
             conv_bias: Whether to include bias terms on the convolution path.
             use_fast_path: Unused flag reserved for fused-kernel integration.
@@ -81,7 +81,6 @@ class Mamba1(nn.Module):
             dtype: Optional dtype for parameter initialization.
         """
         super().__init__()
-        del dt_min, dt_max, dt_init_floor  # Documented for parity with fused kernels.
 
         self.d_model = d_model
         self.d_state = d_state
@@ -90,6 +89,31 @@ class Mamba1(nn.Module):
         self.inner_dim = expand * d_model
         self.layer_idx = layer_idx
         self.use_fast_path = use_fast_path
+
+        if isinstance(dt_rank, str):
+            if dt_rank != "auto":
+                raise ValueError("dt_rank must be an integer or 'auto'.")
+            self.dt_rank = math.ceil(d_model / 16)
+        else:
+            if dt_rank <= 0:
+                raise ValueError(
+                    "dt_rank must be positive when provided as an integer."
+                )
+            self.dt_rank = int(dt_rank)
+
+        if dt_min <= 0 or dt_max <= 0:
+            raise ValueError("dt_min and dt_max must be positive.")
+        if dt_min > dt_max:
+            raise ValueError("dt_min must be less than or equal to dt_max.")
+        if dt_init_floor < 0:
+            raise ValueError("dt_init_floor must be non-negative.")
+        if dt_init not in {"random", "constant"}:
+            raise ValueError("dt_init must be either 'random' or 'constant'.")
+
+        self.dt_min = dt_min
+        self.dt_max = dt_max
+        self.dt_init_floor = dt_init_floor
+        self.dt_init = dt_init
 
         factory_kwargs: dict[str, Any] = {}
         if device is not None:
@@ -101,9 +125,16 @@ class Mamba1(nn.Module):
             d_model, 2 * self.inner_dim, bias=bias, **factory_kwargs
         )
         self.out_proj = nn.Linear(self.inner_dim, d_model, bias=bias, **factory_kwargs)
-        self.dt_proj = nn.Linear(
-            self.inner_dim, self.inner_dim, bias=True, **factory_kwargs
+        self.x_proj = nn.Linear(
+            self.inner_dim,
+            self.dt_rank + 2 * self.d_state,
+            bias=False,
+            **factory_kwargs,
         )
+        self.dt_proj = nn.Linear(
+            self.dt_rank, self.inner_dim, bias=False, **factory_kwargs
+        )
+        self.dt_bias = nn.Parameter(torch.zeros(self.inner_dim, **factory_kwargs))
 
         conv_weight = torch.randn(self.inner_dim, d_conv, **factory_kwargs) * 0.02
         self.conv_weight = nn.Parameter(conv_weight)
@@ -116,14 +147,24 @@ class Mamba1(nn.Module):
         self.A_log = nn.Parameter(
             torch.zeros(self.inner_dim, d_state, **factory_kwargs)
         )
-        self.B = nn.Parameter(
-            torch.randn(self.inner_dim, d_state, **factory_kwargs) * 0.02
-        )
-        self.C = nn.Parameter(
-            torch.randn(self.inner_dim, d_state, **factory_kwargs) * 0.02
-        )
         self.D = nn.Parameter(torch.ones(self.inner_dim, **factory_kwargs))
-        self.dt_bias = nn.Parameter(torch.zeros(self.inner_dim, **factory_kwargs))
+
+        # Time-step projection initialisation mirroring the upstream recurrence.
+        dt_init_std = self.dt_rank**-0.5
+        if self.dt_init == "constant":
+            nn.init.constant_(self.dt_proj.weight, dt_init_std)
+        else:  # random
+            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+
+        dt = torch.exp(
+            torch.rand(self.inner_dim, **factory_kwargs)
+            * (math.log(self.dt_max) - math.log(self.dt_min))
+            + math.log(self.dt_min)
+        ).clamp(min=self.dt_init_floor)
+        inv_softplus = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_bias.copy_(inv_softplus)
+        setattr(self.dt_bias, "_no_reinit", True)
 
     def forward(
         self, hidden_states: torch.Tensor, inference_params=None, **kwargs
@@ -166,17 +207,28 @@ class Mamba1(nn.Module):
             activation="silu",
         ).to(compute_dtype)
 
-        delta = _linear_1x1(self.dt_proj, conv_out, compute_dtype)
+        tokens = conv_out.permute(0, 2, 1)
+        proj_tokens = self.x_proj(tokens)
+        dt_low_rank, B_proj, C_proj = torch.split(
+            proj_tokens, [self.dt_rank, self.d_state, self.d_state], dim=-1
+        )
+
+        delta = F.linear(
+            dt_low_rank,
+            self.dt_proj.weight.to(compute_dtype),
+        ).permute(0, 2, 1)
         u = conv_out
         z = gate.permute(0, 2, 1).to(compute_dtype)
+        B = B_proj.permute(0, 2, 1).unsqueeze(1).to(compute_dtype)
+        C = C_proj.permute(0, 2, 1).unsqueeze(1).to(compute_dtype)
 
         A = -torch.exp(self.A_log.to(compute_dtype))
         scan_out = ops.selective_scan(
             u=u,
             delta=delta,
             A=A,
-            B=self.B,
-            C=self.C,
+            B=B,
+            C=C,
             D=self.D,
             z=z,
             dt_bias=self.dt_bias,
@@ -289,21 +341,26 @@ class Mamba1(nn.Module):
             conv_out = conv_out + self.conv_bias.to(compute_dtype)
         conv_out = F.silu(conv_out)
 
+        proj_tokens = self.x_proj(conv_out)
+        dt_low_rank, B_proj, C_proj = torch.split(
+            proj_tokens, [self.dt_rank, self.d_state, self.d_state], dim=-1
+        )
         delta = F.linear(
-            conv_out,
+            dt_low_rank,
             self.dt_proj.weight.to(compute_dtype),
-            self.dt_proj.bias.to(compute_dtype),
         )
         A = -torch.exp(self.A_log.to(compute_dtype))
         z = gate.to(compute_dtype)
+        B = B_proj.unsqueeze(1).to(compute_dtype)
+        C = C_proj.unsqueeze(1).to(compute_dtype)
 
         output = ops.selective_state_step(
             ssm_state,
             conv_out,
             delta,
             A,
-            self.B,
-            self.C,
+            B,
+            C,
             self.D,
             z=z,
             dt_bias=self.dt_bias,

@@ -56,6 +56,10 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - CUDA kernels and bindings for selective scan, selective state step, SSD chunk scan, depthwise causal convolution, and fused layer norm with GPU-dispatch integration and CUDA-focused tests.
 - Stress tests that cover long sequences, high state dimensions, grouped parameters, and mixed-precision execution paths under `tests/stress/`.
 ### Changed
+- Redesigned the reference Mamba1 block to expose ``dt_rank`` and the upstream
+  softplus bias schedule, align the low-rank ``dt/B/C`` projections with the
+  recurrence used in ``mamba_ssm``, refresh the module docs/config defaults,
+  and add upstream parity regression tests under ``tests/modules``.
 - Consolidated the CUDA parity goldens behind `refresh_mamba_goldens.py`,
   teaching the CUDA parity tests to stream data from `tests/mamba_reference_cases.json`
   when present and otherwise skip with guidance to regenerate locally.
