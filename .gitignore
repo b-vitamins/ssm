@@ -3,5 +3,3 @@ __pycache__/
 src/ssm.egg-info/
 reference_mamba/
 external/
-
-tests/mamba_reference_cases.json
