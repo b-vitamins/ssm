@@ -127,7 +127,7 @@ class Mamba1(nn.Module):
         self.out_proj = nn.Linear(self.inner_dim, d_model, bias=bias, **factory_kwargs)
         self.x_proj = nn.Linear(
             self.inner_dim,
-            self.dt_rank + 2 * self.d_state,
+            self.dt_rank + 2 * self.inner_dim,
             bias=False,
             **factory_kwargs,
         )
@@ -135,6 +135,13 @@ class Mamba1(nn.Module):
             self.dt_rank, self.inner_dim, bias=False, **factory_kwargs
         )
         self.dt_bias = nn.Parameter(torch.zeros(self.inner_dim, **factory_kwargs))
+
+        self.B = nn.Parameter(
+            torch.randn(self.inner_dim, self.d_state, **factory_kwargs) * 0.02
+        )
+        self.C = nn.Parameter(
+            torch.randn(self.inner_dim, self.d_state, **factory_kwargs) * 0.02
+        )
 
         conv_weight = torch.randn(self.inner_dim, d_conv, **factory_kwargs) * 0.02
         self.conv_weight = nn.Parameter(conv_weight)
@@ -210,7 +217,7 @@ class Mamba1(nn.Module):
         tokens = conv_out.permute(0, 2, 1)
         proj_tokens = self.x_proj(tokens)
         dt_low_rank, B_proj, C_proj = torch.split(
-            proj_tokens, [self.dt_rank, self.d_state, self.d_state], dim=-1
+            proj_tokens, [self.dt_rank, self.inner_dim, self.inner_dim], dim=-1
         )
 
         delta = F.linear(
@@ -219,8 +226,12 @@ class Mamba1(nn.Module):
         ).permute(0, 2, 1)
         u = conv_out
         z = gate.permute(0, 2, 1).to(compute_dtype)
-        B = B_proj.permute(0, 2, 1).unsqueeze(1).to(compute_dtype)
-        C = C_proj.permute(0, 2, 1).unsqueeze(1).to(compute_dtype)
+        B_gates = B_proj.permute(0, 2, 1).to(compute_dtype)
+        C_gates = C_proj.permute(0, 2, 1).to(compute_dtype)
+        base_B = self.B.to(compute_dtype).view(1, self.inner_dim, self.d_state, 1)
+        base_C = self.C.to(compute_dtype).view(1, self.inner_dim, self.d_state, 1)
+        B = base_B * (1 + B_gates.unsqueeze(2))
+        C = base_C * (1 + C_gates.unsqueeze(2))
 
         A = -torch.exp(self.A_log.to(compute_dtype))
         scan_out = ops.selective_scan(
@@ -343,7 +354,7 @@ class Mamba1(nn.Module):
 
         proj_tokens = self.x_proj(conv_out)
         dt_low_rank, B_proj, C_proj = torch.split(
-            proj_tokens, [self.dt_rank, self.d_state, self.d_state], dim=-1
+            proj_tokens, [self.dt_rank, self.inner_dim, self.inner_dim], dim=-1
         )
         delta = F.linear(
             dt_low_rank,
@@ -351,8 +362,10 @@ class Mamba1(nn.Module):
         )
         A = -torch.exp(self.A_log.to(compute_dtype))
         z = gate.to(compute_dtype)
-        B = B_proj.unsqueeze(1).to(compute_dtype)
-        C = C_proj.unsqueeze(1).to(compute_dtype)
+        base_B = self.B.to(compute_dtype)
+        base_C = self.C.to(compute_dtype)
+        B = base_B.unsqueeze(0) * (1 + B_proj.to(compute_dtype).unsqueeze(-1))
+        C = base_C.unsqueeze(0) * (1 + C_proj.to(compute_dtype).unsqueeze(-1))
 
         output = ops.selective_state_step(
             ssm_state,
